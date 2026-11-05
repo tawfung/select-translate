@@ -2,6 +2,8 @@
 name = "select-translate"
 version = "1.0.0"
 edition = "2021"
+license = "MIT"
+repository = "https://github.com/tawfung/select-translate"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
@@ -9,6 +11,7 @@ serde_json = "1"
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
+    "Win32_Graphics_GdiPlus",
     "Win32_System_Console",
     "Win32_System_DataExchange",
     "Win32_System_LibraryLoader",

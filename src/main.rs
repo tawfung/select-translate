@@ -133,10 +133,34 @@ Write the TEXT in the TARGET language:
 Keep the sentence type (statement, question, request) and the tone of the original.
 Keep names, code, numbers, URLs, @mentions and emoji unchanged. Use a polite, natural tone.
 Vietnamese address words (anh, chị, em, bạn, ơi) are politeness markers: never render them as family terms (哥, 姐, 弟, 妹, brother, sister); drop them or use a neutral form.
+If an image is attached, the TEXT is the text shown in the image (a screenshot of a chat, game UI, document...): read all of it in reading order and write it in the TARGET language with the same rules, one line per text block; if the image has no readable text, describe it in one short sentence in the TARGET language.
 Output only the resulting text: no quotes, no labels, no notes.";
+
+const IMG_TEXT: &str = "(the text in the attached image)";
 
 fn user_msg(target: &str, text: &str) -> String {
     format!("TARGET: {target}\nTEXT:\n<<<\n{text}\n>>>")
+}
+
+fn b64(d: &[u8]) -> String {
+    const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut s = String::with_capacity(d.len().div_ceil(3) * 4);
+    for c in d.chunks(3) {
+        let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
+        for i in 0..4 {
+            s.push(if i <= c.len() { T[(n >> (18 - 6 * i) & 63) as usize] as char } else { '=' });
+        }
+    }
+    s
+}
+
+#[cfg(test)]
+#[test]
+fn b64_ok() {
+    assert_eq!(b64(b""), "");
+    assert_eq!(b64(b"f"), "Zg==");
+    assert_eq!(b64(b"fo"), "Zm8=");
+    assert_eq!(b64(b"foobar"), "Zm9vYmFy");
 }
 
 // ---------------------------------------------------------------- CLI discovery
@@ -294,18 +318,30 @@ impl Claude {
         Ok(())
     }
 
-    fn translate(&mut self, c: &Config, msg: &str, part: &dyn Fn(&str)) -> Result<String, String> {
-        match self.once(c, msg, part) {
+    fn translate(&mut self, c: &Config, msg: &str, img: Option<&std::path::Path>, part: &dyn Fn(&str)) -> Result<String, String> {
+        let r = match self.once(c, msg, img, part) {
             Err(e) if e.contains("thinking") && self.thinking_off_ok.get(&c.claude_model) != Some(&false) => {
                 self.thinking_off_ok.insert(c.claude_model.clone(), false);
                 self.close();
-                self.once(c, msg, part)
+                self.once(c, msg, img, part)
             }
             r => r,
+        };
+        if img.is_some() {
+            self.turns = RESET_AFTER; // an image stays in the history: start the next translation in a fresh process
         }
+        r
     }
 
-    fn once(&mut self, c: &Config, msg: &str, part: &dyn Fn(&str)) -> Result<String, String> {
+    fn once(&mut self, c: &Config, msg: &str, img: Option<&std::path::Path>, part: &dyn Fn(&str)) -> Result<String, String> {
+        let content = match img {
+            Some(p) => {
+                let data = fs::read(p).map_err(|e| e.to_string())?;
+                json!([{"type": "image", "source": {"type": "base64", "media_type": "image/png", "data": b64(&data)}},
+                       {"type": "text", "text": msg}])
+            }
+            None => json!(msg),
+        };
         let alive = match self.p.as_mut() {
             Some((ch, _, _)) => matches!(ch.try_wait(), Ok(None)),
             None => false,
@@ -315,7 +351,7 @@ impl Claude {
         }
         self.turns += 1;
         let (_, stdin, out) = self.p.as_mut().unwrap();
-        let line = json!({"type": "user", "message": {"role": "user", "content": msg}}).to_string() + "\n";
+        let line = json!({"type": "user", "message": {"role": "user", "content": content}}).to_string() + "\n";
         if stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()).is_err() {
             self.close();
             return Err("Không gửi được tới Claude CLI".into());
@@ -458,7 +494,7 @@ impl Codex {
         Ok(())
     }
 
-    fn translate(&mut self, c: &Config, msg: &str, part: &dyn Fn(&str)) -> Result<String, String> {
+    fn translate(&mut self, c: &Config, msg: &str, img: Option<&std::path::Path>, part: &dyn Fn(&str)) -> Result<String, String> {
         let alive = match self.p.as_mut() {
             Some((ch, _, _)) => matches!(ch.try_wait(), Ok(None)),
             None => false,
@@ -466,10 +502,14 @@ impl Codex {
         if !alive || self.turns >= RESET_AFTER || self.key != (c.codex_model.clone(), c.codex_effort.clone()) {
             self.start(c)?;
         }
-        self.turns += 1;
+        self.turns = if img.is_some() { RESET_AFTER } else { self.turns + 1 }; // an image stays in the thread: fresh one next time
         let id = self.next_id;
         self.next_id += 1;
-        let params = json!({"threadId": self.thread, "effort": c.codex_effort, "input": [{"type": "text", "text": msg}]});
+        let mut input = vec![json!({"type": "text", "text": msg})];
+        if let Some(p) = img {
+            input.insert(0, json!({"type": "localImage", "path": p}));
+        }
+        let params = json!({"threadId": self.thread, "effort": c.codex_effort, "input": input});
         if let Err(e) = self.send(json!({"id": id, "method": "turn/start", "params": params})) {
             self.close();
             return Err(e);
@@ -693,6 +733,8 @@ fn tray_menu() {
         };
         add(MF_STRING | MF_GRAYED, 0, &format!("Select Translate · {}", head.trim_end_matches(" · → VI")));
         add(MF_SEPARATOR, 0, "");
+        add(MF_STRING, 7, "Dịch ảnh: chọn vùng màn hình…\tCtrl+Alt+S");
+        add(MF_SEPARATOR, 0, "");
         let pet_on = st(|s| s.cfg.pet);
         add(MF_STRING | if pet_on { MF_CHECKED } else { 0 }, 4, "Pet: click pet rồi bôi đen mới dịch\tCtrl+Alt+P");
         add(MF_STRING | if paused { MF_CHECKED } else { 0 }, 1, "Tạm dừng\tCtrl+Alt+T");
@@ -711,6 +753,7 @@ fn tray_menu() {
         match cmd {
             1 => toggle_pause(),
             4 => toggle_pet(),
+            7 => snip_start(),
             2 => model_menu(),
             3 => {
                 let _ = Command::new("notepad.exe").arg(cfg_path()).spawn();
@@ -993,7 +1036,7 @@ unsafe extern "system" fn pet_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM)
                 pet_snap();
             }
         }
-        WM_RBUTTONUP => tray_menu(),
+        WM_RBUTTONUP => snip_start(), // right-click on the pet = translate a screen region; the menu lives on the tray icon
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     }
     0
@@ -1106,6 +1149,7 @@ struct Job {
     cfg: Config,
     target: usize,
     text: String,
+    image: Option<PathBuf>, // a screen snip (PNG): translate the text in it
 }
 struct Done {
     key: Key,
@@ -1145,14 +1189,15 @@ fn worker(rx: mpsc::Receiver<Job>, first: Config) {
             job = j; // only the newest selection matters
         }
         let t = Instant::now();
-        let msg = user_msg(TARGETS[job.target].1, &job.text);
+        let msg = user_msg(TARGETS[job.target].1, if job.image.is_some() { IMG_TEXT } else { &job.text });
         let rid = job.rid;
+        let img = job.image.as_deref();
         let r = if job.cfg.backend == "codex" {
             claude.close(); // only the backend in use keeps a process
-            codex.translate(&job.cfg, &msg, &|s| post(WM_PART, rid, s.to_string()))
+            codex.translate(&job.cfg, &msg, img, &|s| post(WM_PART, rid, s.to_string()))
         } else {
             codex.close();
-            claude.translate(&job.cfg, &msg, &|s| post(WM_PART, rid, s.to_string()))
+            claude.translate(&job.cfg, &msg, img, &|s| post(WM_PART, rid, s.to_string()))
         };
         match r {
             Ok(out) => {
@@ -1196,6 +1241,9 @@ struct State {
     rid: u64,
     toast_rid: u64,
     text: String,
+    image: Option<PathBuf>,       // set when the popup shows a screen snip
+    snips: u32,                   // snip counter: cache key of each snip
+    snip_end: Option<Instant>,    // the mouse-up that ends a snip must not count as a text selection
     wrap: (String, String), // whitespace before/after the selection
     target: usize,
     result: String,
@@ -1271,7 +1319,11 @@ fn layout(show: bool) {
             let mut specs: Vec<(u32, String)> = Vec::new();
             if !toast {
                 specs.extend(TARGETS.iter().enumerate().map(|(i, t)| (B_VI + i as u32, t.0.to_string())));
-                specs.extend([(B_COPY, "Copy".into()), (B_PASTE, "Dán thay".into()), (B_MODEL, "Model ▾".into())]);
+                specs.push((B_COPY, "Copy".into()));
+                if s.image.is_none() {
+                    specs.push((B_PASTE, "Dán thay".into())); // a snip has no selection to replace
+                }
+                specs.push((B_MODEL, "Model ▾".into()));
                 if s.error {
                     specs.push((B_LOGIN, "Đăng nhập".into()));
                 }
@@ -1374,7 +1426,7 @@ fn run() {
             s.head = format!("{} · đang dịch…", label(&s.cfg, s.target));
             s.body = "…".into();
             s.busy = true;
-            let _ = s.tx.send(Job { rid: s.rid, cfg: s.cfg.clone(), target: s.target, text: s.text.clone() });
+            let _ = s.tx.send(Job { rid: s.rid, cfg: s.cfg.clone(), target: s.target, text: s.text.clone(), image: s.image.clone() });
         }
     });
     layout(true);
@@ -1383,8 +1435,8 @@ fn run() {
 // ---------------------------------------------------------------- actions
 /// Pet off: every selection in `apps` is translated. Pet on: only after the pet was clicked (any app).
 fn on_select(x: i32, y: i32) {
-    let (paused, pet_on, armed) = st(|s| (s.paused, s.cfg.pet, s.armed));
-    if paused || (pet_on && !armed) || in_popup(x, y) || in_pet(x, y) {
+    let (paused, pet_on, armed, snip) = st(|s| (s.paused, s.cfg.pet, s.armed, s.snip_end.is_some_and(|t| t.elapsed().as_millis() < 500)));
+    if paused || (pet_on && !armed) || snip || snip_active() || in_popup(x, y) || in_pet(x, y) {
         return;
     }
     let fg = unsafe { GetForegroundWindow() };
@@ -1447,6 +1499,7 @@ fn on_text(src: isize, x: i32, y: i32, raw: String) {
         s.src = src;
         s.anchor = (x, y);
         s.text = text;
+        s.image = None;
         s.wrap = (lead, tail);
         s.target = 0; // default: Vietnamese
         false
@@ -1572,6 +1625,296 @@ fn click(id: u32) {
     }
 }
 
+// ---------------------------------------------------------------- snip: translate the text in a screen region
+// The screen is frozen into a bitmap, shown dimmed full-screen; the dragged rectangle shows the bright copy.
+// On release the region (long edge max SNIP_MAX px) is saved as PNG and sent to the model with the image.
+const SNIP_MAX: i32 = 1600; // the models scale larger images down anyway
+const SNIP_EDGE: u32 = 0x00c7_db4c; // teal, like the armed pet
+
+struct Snip {
+    vx: i32,
+    vy: i32,
+    dc: [HDC; 2], // 0 = screen copy, 1 = dimmed copy (with the hint text)
+    bmp: [HBITMAP; 2],
+    old: [HGDIOBJ; 2],
+    start: Option<(i32, i32)>,
+    sel: RECT,
+}
+
+thread_local! {
+    static SNIP: RefCell<Option<Snip>> = const { RefCell::new(None) };
+}
+
+fn snip_active() -> bool {
+    SNIP.with(|s| s.borrow().is_some())
+}
+
+/// 32-bit top-down DIB section and its pixels.
+unsafe fn dib(dc: HDC, w: i32, h: i32) -> (HBITMAP, *mut u32) {
+    let mut bi: BITMAPINFO = std::mem::zeroed();
+    bi.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+    bi.bmiHeader.biWidth = w;
+    bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+    let mut bits = null_mut();
+    let b = CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+    (b, bits as *mut u32)
+}
+
+/// Save a bitmap as PNG with GDI+ (part of Windows: no image library in the exe).
+unsafe fn save_png(bm: HBITMAP, path: &std::path::Path) -> bool {
+    use windows_sys::Win32::Graphics::GdiPlus as gp;
+    let mut tok = 0usize;
+    let input = gp::GdiplusStartupInput { GdiplusVersion: 1, DebugEventCallback: 0, SuppressBackgroundThread: 0, SuppressExternalCodecs: 0 };
+    if gp::GdiplusStartup(&mut tok, &input, null_mut()) != 0 {
+        return false;
+    }
+    let mut img = null_mut();
+    let mut ok = gp::GdipCreateBitmapFromHBITMAP(bm, null_mut(), &mut img) == 0;
+    if ok {
+        let png = windows_sys::core::GUID::from_u128(0x557cf406_1a04_11d3_9a73_0000f81ef32e); // PNG encoder
+        let p = w(&path.to_string_lossy());
+        ok = gp::GdipSaveImageToFile(img as *mut gp::GpImage, p.as_ptr(), &png, null()) == 0;
+        gp::GdipDisposeImage(img as *mut gp::GpImage);
+    }
+    gp::GdiplusShutdown(tok);
+    ok
+}
+
+#[cfg(test)]
+#[test]
+fn snip_png_ok() {
+    // a 300x120 screen grab through the same DIB + GDI+ path as a snip is a valid PNG
+    unsafe {
+        let scr = GetDC(null_mut());
+        let mem = CreateCompatibleDC(scr);
+        let (bm, px) = dib(scr, 300, 120);
+        assert!(!px.is_null());
+        let ob = SelectObject(mem, bm);
+        BitBlt(mem, 0, 0, 300, 120, scr, 0, 0, SRCCOPY | CAPTUREBLT);
+        SelectObject(mem, ob);
+        DeleteDC(mem);
+        ReleaseDC(null_mut(), scr);
+        let p = std::env::temp_dir().join("select-translate-test.png");
+        assert!(save_png(bm, &p));
+        DeleteObject(bm);
+        let d = fs::read(&p).unwrap();
+        assert_eq!(&d[..8], b"\x89PNG\r\n\x1a\n");
+        assert_eq!(u32::from_be_bytes(d[16..20].try_into().unwrap()), 300);
+        let _ = fs::remove_file(p);
+    }
+}
+
+fn snip_start() {
+    if snip_active() {
+        return;
+    }
+    unsafe {
+        hide();
+        let pet_on = st(|s| s.cfg.pet);
+        if pet_on {
+            ShowWindow(pet(), SW_HIDE);
+        }
+        thread::sleep(Duration::from_millis(150)); // let the menu and the hidden windows leave the screen
+        let (vx, vy) = (GetSystemMetrics(SM_XVIRTUALSCREEN), GetSystemMetrics(SM_YVIRTUALSCREEN));
+        let (vw, vh) = (GetSystemMetrics(SM_CXVIRTUALSCREEN), GetSystemMetrics(SM_CYVIRTUALSCREEN));
+        let scr = GetDC(null_mut());
+        let dc = [CreateCompatibleDC(scr), CreateCompatibleDC(scr)];
+        let ((b0, p0), (b1, p1)) = (dib(scr, vw, vh), dib(scr, vw, vh));
+        if p0.is_null() || p1.is_null() {
+            ReleaseDC(null_mut(), scr);
+            for (d, b) in dc.into_iter().zip([b0, b1]) {
+                DeleteDC(d);
+                DeleteObject(b);
+            }
+            if pet_on {
+                ShowWindow(pet(), SW_SHOWNOACTIVATE);
+            }
+            toast("Không chụp được màn hình");
+            return;
+        }
+        let old = [SelectObject(dc[0], b0), SelectObject(dc[1], b1)];
+        BitBlt(dc[0], 0, 0, vw, vh, scr, vx, vy, SRCCOPY | CAPTUREBLT);
+        ReleaseDC(null_mut(), scr);
+        GdiFlush();
+        let n = (vw * vh) as usize;
+        let (a, b) = (std::slice::from_raw_parts(p0, n), std::slice::from_raw_parts_mut(p1, n));
+        for (d, s) in b.iter_mut().zip(a) {
+            *d = (s >> 1) & 0x007f_7f7f; // half brightness
+        }
+        // hint at the top of the screen under the cursor
+        let mut pt = POINT { x: 0, y: 0 };
+        GetCursorPos(&mut pt);
+        let (wa, dpi) = monitor_of(pt.x, pt.y);
+        let face = w("Segoe UI");
+        let font = CreateFontW(-(12 * dpi as i32 / 72), 0, 0, 0, 600, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr());
+        let of = SelectObject(dc[1], font);
+        SetBkMode(dc[1], TRANSPARENT as _);
+        SetTextColor(dc[1], FG);
+        let hint = w("Kéo chuột chọn vùng cần dịch   ·   Esc / chuột phải để huỷ");
+        let mut r = RECT { left: wa.left - vx, top: wa.top - vy + scale(28, dpi), right: wa.right - vx, bottom: wa.top - vy + scale(70, dpi) };
+        DrawTextW(dc[1], hint.as_ptr(), -1, &mut r, DT_CENTER | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc[1], of);
+        DeleteObject(font);
+
+        SNIP.with(|s| *s.borrow_mut() = Some(Snip { vx, vy, dc, bmp: [b0, b1], old, start: None, sel: std::mem::zeroed() }));
+        let hinst = GetModuleHandleW(null());
+        let cls = w("SelectTranslateSnip");
+        let wc = WNDCLASSW {
+            lpfnWndProc: Some(snip_proc),
+            hInstance: hinst,
+            lpszClassName: cls.as_ptr(),
+            hCursor: LoadCursorW(null_mut(), IDC_CROSS),
+            ..std::mem::zeroed()
+        };
+        RegisterClassW(&wc); // fails harmlessly from the second snip on
+        let title = w("Select Translate");
+        let h = CreateWindowExW(WS_EX_TOPMOST | WS_EX_TOOLWINDOW, cls.as_ptr(), title.as_ptr(), WS_POPUP, vx, vy, vw, vh, null_mut(), null_mut(), hinst, null());
+        ShowWindow(h, SW_SHOW);
+        SetForegroundWindow(h);
+    }
+}
+
+unsafe fn snip_free() {
+    if let Some(s) = SNIP.with(|c| c.borrow_mut().take()) {
+        for i in 0..2 {
+            SelectObject(s.dc[i], s.old[i]);
+            DeleteDC(s.dc[i]);
+            DeleteObject(s.bmp[i]);
+        }
+    }
+    st(|s| s.snip_end = Some(Instant::now()));
+    if st(|s| s.cfg.pet) {
+        ShowWindow(pet(), SW_SHOWNOACTIVATE);
+    }
+}
+
+unsafe fn snip_paint(hwnd: HWND) {
+    let mut ps: PAINTSTRUCT = std::mem::zeroed();
+    let hdc = BeginPaint(hwnd, &mut ps);
+    let p = ps.rcPaint;
+    SNIP.with(|c| {
+        let c = c.borrow();
+        let Some(s) = c.as_ref() else { return };
+        // compose off-screen: no flicker while dragging
+        let (w, h) = (p.right - p.left, p.bottom - p.top);
+        let mem = CreateCompatibleDC(hdc);
+        let bm = CreateCompatibleBitmap(hdc, w, h);
+        let ob = SelectObject(mem, bm);
+        BitBlt(mem, 0, 0, w, h, s.dc[1], p.left, p.top, SRCCOPY);
+        let mut i: RECT = std::mem::zeroed();
+        if s.start.is_some() && IntersectRect(&mut i, &s.sel, &p) != 0 {
+            BitBlt(mem, i.left - p.left, i.top - p.top, i.right - i.left, i.bottom - i.top, s.dc[0], i.left, i.top, SRCCOPY);
+        }
+        if s.start.is_some() {
+            let br = CreateSolidBrush(SNIP_EDGE);
+            for k in 1..3 {
+                let r = RECT { left: s.sel.left - k - p.left, top: s.sel.top - k - p.top, right: s.sel.right + k - p.left, bottom: s.sel.bottom + k - p.top };
+                FrameRect(mem, &r, br);
+            }
+            DeleteObject(br);
+        }
+        BitBlt(hdc, p.left, p.top, w, h, mem, 0, 0, SRCCOPY);
+        SelectObject(mem, ob);
+        DeleteObject(bm);
+        DeleteDC(mem);
+    });
+    EndPaint(hwnd, &ps);
+}
+
+/// Save the selected region (client coordinates) as PNG and translate it.
+unsafe fn snip_done(hwnd: HWND, r: RECT) {
+    let path = workdir().join("snip.png");
+    let (w, h) = (r.right - r.left, r.bottom - r.top);
+    let k = (SNIP_MAX as f32 / w.max(h) as f32).min(1.0);
+    let (ow, oh) = (((w as f32 * k).round() as i32).max(1), ((h as f32 * k).round() as i32).max(1));
+    let res = SNIP.with(|c| {
+        let c = c.borrow();
+        let s = c.as_ref()?;
+        let mem = CreateCompatibleDC(s.dc[0]);
+        let (bm, _) = dib(s.dc[0], ow, oh);
+        let ob = SelectObject(mem, bm);
+        SetStretchBltMode(mem, HALFTONE);
+        SetBrushOrgEx(mem, 0, 0, null_mut());
+        StretchBlt(mem, 0, 0, ow, oh, s.dc[0], r.left, r.top, w, h, SRCCOPY);
+        SelectObject(mem, ob);
+        DeleteDC(mem);
+        let ok = save_png(bm, &path);
+        DeleteObject(bm);
+        Some((ok, (s.vx + r.left, s.vy + r.bottom)))
+    });
+    DestroyWindow(hwnd);
+    match res {
+        Some((true, anchor)) => {
+            st(|s| {
+                s.snips += 1;
+                s.text = format!("[ảnh #{}]", s.snips); // cache key: one entry per snip and target
+                s.image = Some(path);
+                s.src = 0;
+                s.anchor = anchor;
+                s.wrap = Default::default();
+                s.target = 0;
+            });
+            run();
+        }
+        _ => toast("Không lưu được ảnh vùng đã chọn"),
+    }
+}
+
+unsafe extern "system" fn snip_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
+    match msg {
+        WM_ERASEBKGND => return 1,
+        WM_PAINT => snip_paint(hwnd),
+        WM_LBUTTONDOWN => {
+            SetCapture(hwnd);
+            SNIP.with(|c| {
+                if let Some(s) = c.borrow_mut().as_mut() {
+                    s.start = Some((x, y));
+                    s.sel = RECT { left: x, top: y, right: x, bottom: y };
+                }
+            });
+        }
+        WM_MOUSEMOVE => {
+            let changed = SNIP.with(|c| {
+                let mut c = c.borrow_mut();
+                let s = c.as_mut()?;
+                let (sx, sy) = s.start?;
+                let old = s.sel;
+                s.sel = RECT { left: sx.min(x), top: sy.min(y), right: sx.max(x) + 1, bottom: sy.max(y) + 1 };
+                Some((old, s.sel))
+            });
+            if let Some((a, b)) = changed {
+                for r in [a, b] {
+                    let r = RECT { left: r.left - 3, top: r.top - 3, right: r.right + 3, bottom: r.bottom + 3 };
+                    InvalidateRect(hwnd, &r, 0);
+                }
+            }
+        }
+        WM_LBUTTONUP => {
+            ReleaseCapture();
+            let sel = SNIP.with(|c| c.borrow_mut().as_mut().and_then(|s| s.start.take().map(|_| s.sel)));
+            match sel {
+                Some(r) if r.right - r.left >= 8 && r.bottom - r.top >= 8 => snip_done(hwnd, r),
+                _ => {
+                    DestroyWindow(hwnd); // a click without a drag cancels
+                }
+            }
+        }
+        WM_RBUTTONUP => {
+            DestroyWindow(hwnd);
+        }
+        WM_KEYDOWN if wp == VK_ESCAPE as WPARAM => {
+            DestroyWindow(hwnd);
+        }
+        WM_DESTROY => snip_free(),
+        _ => return DefWindowProcW(hwnd, msg, wp, lp),
+    }
+    0
+}
+
 // ---------------------------------------------------------------- window procedure
 unsafe fn paint(hwnd: HWND) {
     let mut ps: PAINTSTRUCT = std::mem::zeroed();
@@ -1689,6 +2032,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 toggle_pause();
             } else if wp == 3 {
                 toggle_pet();
+            } else if wp == 4 {
+                snip_start();
             } else if wp == 2 {
                 DestroyWindow(hwnd);
             }
@@ -1740,7 +2085,7 @@ fn selftest(cfg: &Config, which: &str) -> i32 {
     for (target, text) in cases {
         let t = Instant::now();
         let msg = user_msg(TARGETS[target].1, text);
-        let r = if which == "codex" { codex.translate(&c, &msg, &|_| {}) } else { claude.translate(&c, &msg, &|_| {}) };
+        let r = if which == "codex" { codex.translate(&c, &msg, None, &|_| {}) } else { claude.translate(&c, &msg, None, &|_| {}) };
         match r {
             Ok(o) => {
                 let bad = o.is_empty() || o == text || o.contains('哥');
@@ -1759,11 +2104,35 @@ fn selftest(cfg: &Config, which: &str) -> i32 {
     fail
 }
 
+/// `--image <png> [claude|codex]`: translate the text in an image file to Vietnamese and print it.
+fn image_test(cfg: &Config, png: &str, which: &str) -> i32 {
+    let mut c = cfg.clone();
+    c.backend = which.into();
+    let t = Instant::now();
+    let msg = user_msg(TARGETS[0].1, IMG_TEXT);
+    let p = std::path::Path::new(png);
+    let r = if which == "codex" { Codex::new().translate(&c, &msg, Some(p), &|_| {}) } else { Claude::new().translate(&c, &msg, Some(p), &|_| {}) };
+    match r {
+        Ok(o) => {
+            println!("{:.1}s {which}\n{o}", t.elapsed().as_secs_f32());
+            0
+        }
+        Err(e) => {
+            println!("ERR {e}");
+            1
+        }
+    }
+}
+
 // ---------------------------------------------------------------- main
 fn main() {
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }; // so --models / --selftest print in a terminal
     let args: Vec<String> = std::env::args().collect();
     let cfg = load_cfg();
+    if let Some(i) = args.iter().position(|a| a == "--image") {
+        let which = if args.get(i + 2).map(String::as_str) == Some("codex") { "codex" } else { "claude" };
+        std::process::exit(image_test(&cfg, args.get(i + 1).map(String::as_str).unwrap_or(""), which));
+    }
     if let Some(i) = args.iter().position(|a| a == "--login") {
         let be = if args.get(i + 1).map(String::as_str) == Some("codex") { "codex" } else { "claude" };
         if !login(&cfg, be) {
@@ -1851,7 +2220,7 @@ fn main() {
             *c.borrow_mut() = Some(State {
                 cfg, tx, visible: false, paused: false, menu_open: false, armed: false, busy: false,
                 t0: Instant::now(), pet_drag: None, rid: 0, toast_rid: 0,
-                text: String::new(), wrap: Default::default(), target: 0, result: String::new(), head: String::new(), body: String::new(),
+                text: String::new(), image: None, snips: 0, snip_end: None, wrap: Default::default(), target: 0, result: String::new(), head: String::new(), body: String::new(),
                 error: false, src: 0, anchor: (0, 0), cache: HashMap::new(), dpi: 0, fonts: [0; 3], icon: 0,
                 icon_at: (0, 0, 0), brushes,
                 head_rc: std::mem::zeroed(), body_rc: std::mem::zeroed(), btns: Vec::new(),
@@ -1862,6 +2231,7 @@ fn main() {
         RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, b'T' as u32);
         RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, b'Q' as u32);
         RegisterHotKey(hwnd, 3, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, b'P' as u32);
+        RegisterHotKey(hwnd, 4, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, b'S' as u32);
         TRAY_ICON.store(app_icon(GetSystemMetrics(SM_CXSMICON)), Ordering::Relaxed);
         tray(NIM_ADD);
 
@@ -1888,7 +2258,7 @@ fn main() {
             pet_show(true);
         }
         toast(if pet_on {
-            "Đang chạy · click pet rồi bôi đen để dịch · Ctrl+Alt+P tắt pet (bôi đen trong iMe là dịch luôn)"
+            "Đang chạy · click pet = bật/tắt dịch bôi đen · chuột phải pet = dịch ảnh · Ctrl+Alt+P tắt pet"
         } else {
             "Đang chạy · bôi đen trong iMe là dịch · Ctrl+Alt+P bật pet · Ctrl+Alt+T tạm dừng"
         });

@@ -21,6 +21,7 @@
           <Component Id="App" Guid="5C1B7A40-3E9D-4F7B-9A2E-6D8C1F4B2A71">
             <File Id="AppExe" Source="target\release\select-translate.exe" />
             <File Source="README.md" />
+            <File Source="LICENSE" Name="LICENSE.txt" />
             <RemoveFile Id="Config" Name="config.json" On="uninstall" />
             <RemoveFolder Id="RmInstall" On="uninstall" />
             <RemoveFolder Id="RmPrograms" Directory="LocalPrograms" On="uninstall" />

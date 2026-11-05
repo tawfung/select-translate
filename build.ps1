@@ -58,5 +58,5 @@ if ($LASTEXITCODE) { exit $LASTEXITCODE }
 Remove-Item dist\*.wixpdb -ErrorAction SilentlyContinue
 "release: $msi  $((Get-Item $msi).Length) bytes"
 $zip = "dist\select-translate-portable.zip"
-Compress-Archive $exe, README.md $zip -Force
+Compress-Archive $exe, README.md, LICENSE $zip -Force
 "release: $zip  $((Get-Item $zip).Length) bytes"

@@ -29,6 +29,7 @@ Dùng luôn tài khoản Claude/ChatGPT đã đăng nhập trên máy, không c�
 ## Tính năng
 
 - **Bôi đen là dịch**: popup hiện ngay cạnh chữ, mặc định dịch sang tiếng Việt.
+- **Dịch ảnh như Snipping Tool**: chuột phải vào pet (hoặc `Ctrl+Alt+S`) rồi kéo khung quanh chỗ cần dịch: ảnh chụp màn hình, game, video, file PDF scan… AI đọc chữ trong khung và dịch luôn.
 - **Viết lại EN / 中文**: bấm EN hoặc 中文 để viết lại cho đúng ngữ cảnh. Nếu chữ đã là ngôn ngữ đó, tool chỉ sửa chính tả và câu chữ.
 - **Dán thay**: thay đoạn đang bôi đen bằng bản dịch, rất tiện khi soạn tin nhắn.
 - **Chọn model tuỳ ý**: đổi giữa Claude và Codex, model và mức effort ngay trên popup; danh sách model lấy theo tài khoản của bạn.
@@ -63,11 +64,16 @@ Gỡ cài đặt: *Settings → Apps → Select Translate → Uninstall*.
 
 | Phím tắt | Tác dụng |
 |---|---|
+| `Ctrl+Alt+S` | Dịch ảnh: kéo chọn vùng màn hình (Esc để huỷ) |
 | `Ctrl+Alt+P` | Bật/tắt pet |
 | `Ctrl+Alt+T` | Tạm dừng |
 | `Ctrl+Alt+Q` | Thoát |
 
-Chuột phải vào pet hoặc click icon ở khay hệ thống để mở menu: chọn model, mở cấu hình, đăng nhập Claude/Codex.
+Click pet để bật/tắt dịch bôi đen, chuột phải vào pet để dịch ảnh. Click icon ở khay hệ thống để mở menu: chọn model, mở cấu hình, đăng nhập Claude/Codex.
+
+## Giấy phép
+
+[MIT](LICENSE): tự do dùng, sửa, chia sẻ, kể cả cho mục đích thương mại, miễn là giữ lại thông báo bản quyền.
 
 ## Quyền riêng tư
 
