@@ -4,6 +4,7 @@
 //!   select-translate.exe                      run (tray-less popup; Ctrl+Alt+T pause, Ctrl+Alt+Q quit)
 //!   select-translate.exe --models             list the models this machine's accounts can use
 //!   select-translate.exe --selftest [claude|codex]
+//!   select-translate.exe --reply-test         open reply mode on a fake message, send, quit (exit 0 = no crash)
 //!
 //! Settings: config.json next to the exe (written on first run; the "Model" menu updates it).
 #![windows_subsystem = "windows"]
@@ -1227,6 +1228,18 @@ const B_PASTE: u32 = 2;
 const B_MODEL: u32 = 3;
 const B_LOGIN: u32 = 4;
 const B_CLOSE: u32 = 5;
+const B_REPLY: u32 = 6;
+const B_SEND: u32 = 7;
+
+const EM_SETSEL: u32 = 0x00b1; // edit control messages (windows-sys has them behind the big Controls feature)
+const EM_LIMITTEXT: u32 = 0x00c5;
+static EDIT: AtomicIsize = AtomicIsize::new(0); // the reply input box (child of the popup)
+static EDIT_PROC: AtomicIsize = AtomicIsize::new(0); // its original window procedure
+static EDIT_BG: AtomicIsize = AtomicIsize::new(0);
+
+fn edit() -> HWND {
+    EDIT.load(Ordering::Relaxed) as HWND
+}
 
 struct State {
     cfg: Config,
@@ -1244,6 +1257,11 @@ struct State {
     image: Option<PathBuf>,       // set when the popup shows a screen snip
     snips: u32,                   // snip counter: cache key of each snip
     snip_end: Option<Instant>,    // the mouse-up that ends a snip must not count as a text selection
+    reply: bool,   // reply mode: the user types a reply, the AI writes it in EN/中文; only ✕ closes the popup
+    quote: String, // reply mode: the translation being replied to, shown above the input
+    quote_rc: RECT,
+    edit_rc: RECT, // reply mode: left column, the input box
+    out_rc: RECT,  // reply mode: right column, the AI's version (read-only, copy icon in its corner)
     wrap: (String, String), // whitespace before/after the selection
     target: usize,
     result: String,
@@ -1254,10 +1272,10 @@ struct State {
     anchor: (i32, i32),
     cache: HashMap<Key, String>,
     dpi: u32,
-    fonts: [isize; 3], // head, body, button
+    fonts: [isize; 4], // head, body, button, icons (Segoe MDL2 Assets)
     icon: isize,       // app icon at the popup's DPI
     icon_at: (i32, i32, i32), // x, y, size
-    brushes: [isize; 4], // bg, btn, btn_on, border
+    brushes: [isize; 5], // bg, btn, btn_on, border, reply (teal)
     head_rc: RECT,
     body_rc: RECT,
     btns: Vec<(RECT, u32, String)>,
@@ -1280,9 +1298,11 @@ unsafe fn ensure_fonts(s: &mut State, dpi: u32) {
             DeleteObject(f as _);
         }
     }
-    let face = w("Segoe UI");
-    let mk = |pt: i32, weight: i32| CreateFontW(-(pt * dpi as i32 / 72), 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, face.as_ptr()) as isize;
-    s.fonts = [mk(9, 400), mk(11, 400), mk(9, 600)];
+    let mk = |pt: i32, weight: i32, face: &str| {
+        let f = w(face);
+        CreateFontW(-(pt * dpi as i32 / 72), 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, f.as_ptr()) as isize
+    };
+    s.fonts = [mk(9, 400, "Segoe UI"), mk(11, 400, "Segoe UI"), mk(9, 600, "Segoe UI"), mk(11, 400, "Segoe MDL2 Assets")];
     if s.icon != 0 {
         DestroyIcon(s.icon as _);
     }
@@ -1292,9 +1312,9 @@ unsafe fn ensure_fonts(s: &mut State, dpi: u32) {
 
 unsafe fn text_size(hdc: HDC, font: isize, text: &str, width: i32, flags: u32) -> (i32, i32) {
     SelectObject(hdc, font as _);
-    let t: Vec<u16> = text.encode_utf16().collect();
+    let t = w(text); // NUL-terminated: an empty Vec's pointer is dangling and DrawTextW reads it (crash on an empty body)
     let mut r = RECT { left: 0, top: 0, right: width, bottom: 0 };
-    DrawTextW(hdc, t.as_ptr() as _, t.len() as i32, &mut r, flags | DT_CALCRECT);
+    DrawTextW(hdc, t.as_ptr() as _, t.len() as i32 - 1, &mut r, flags | DT_CALCRECT);
     (r.right - r.left, r.bottom - r.top)
 }
 
@@ -1309,7 +1329,7 @@ fn layout(show: bool) {
         GetMonitorInfoW(mon, &mut mi);
         let (mut dpi, mut _dy) = (96u32, 96u32);
         GetDpiForMonitor(mon, MDT_EFFECTIVE_DPI, &mut dpi, &mut _dy);
-        let (x, y, width, height) = st(|s| {
+        let (x, y, width, height, ed) = st(|s| {
             ensure_fonts(s, dpi);
             let sc = |v| scale(v, dpi);
             let (pad, gap, btn_h) = (sc(12), sc(6), sc(28));
@@ -1317,7 +1337,15 @@ fn layout(show: bool) {
             // buttons first: they set the minimum width
             let toast = s.rid == s.toast_rid; // a notice: no buttons
             let mut specs: Vec<(u32, String)> = Vec::new();
-            if !toast {
+            if s.reply {
+                // a reply is written in EN or 中文 only
+                specs.extend(TARGETS.iter().enumerate().skip(1).map(|(i, t)| (B_VI + i as u32, t.0.to_string())));
+                specs.push((B_SEND, "↵ Viết (Enter)".into()));
+                specs.push((B_MODEL, "Model ▾".into())); // Copy is an icon on the output box
+                if s.error {
+                    specs.push((B_LOGIN, "Đăng nhập".into()));
+                }
+            } else if !toast {
                 specs.extend(TARGETS.iter().enumerate().map(|(i, t)| (B_VI + i as u32, t.0.to_string())));
                 specs.push((B_COPY, "Copy".into()));
                 if s.image.is_none() {
@@ -1333,20 +1361,41 @@ fn layout(show: bool) {
                 .map(|(_, l)| text_size(hdc, s.fonts[2], l, 1000, DT_SINGLELINE).0 + sc(18))
                 .collect();
             let close_w = sc(30);
-            let need = pad * 2 + widths.iter().sum::<i32>() + gap * (widths.len() as i32) + sc(10) + close_w;
-            let width = need.max(sc(500));
+            // the reply button stands apart, on the right next to ✕
+            let reply_l = "↩ Trả lời";
+            let reply_w = if !toast && !s.reply { text_size(hdc, s.fonts[2], reply_l, 1000, DT_SINGLELINE).0 + sc(22) } else { 0 };
+            let need = pad * 2 + widths.iter().sum::<i32>() + gap * (widths.len() as i32) + sc(10) + close_w + reply_w + sc(24);
+            let width = need.max(sc(if s.reply { 720 } else { 500 })); // reply: two columns
             let inner = width - 2 * pad;
             let head_h = text_size(hdc, s.fonts[0], "Ag", inner, DT_SINGLELINE).1;
             let flags = DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL;
-            let body_h = text_size(hdc, s.fonts[1], &s.body, inner, flags).1.min(sc(520)).max(sc(20));
+            let (col_w, copy_w) = ((inner - sc(10)) / 2, sc(32));
+            let text_w = if s.reply { col_w - sc(20) - copy_w } else { inner };
+            let body_h = text_size(hdc, s.fonts[1], &s.body, text_w, flags).1.min(sc(520)).max(sc(20));
+            let quote_h = if s.reply { text_size(hdc, s.fonts[0], &s.quote, inner, flags).1.min(sc(100)) } else { 0 };
             ReleaseDC(hwnd, hdc);
             let ic = sc(16);
             s.icon_at = (pad, pad + (head_h - ic) / 2, ic);
             s.head_rc = RECT { left: pad + ic + sc(6), top: pad, right: width - pad, bottom: pad + head_h };
-            s.body_rc = RECT { left: pad, top: s.head_rc.bottom + sc(4), right: width - pad, bottom: s.head_rc.bottom + sc(4) + body_h };
-            let by = s.body_rc.bottom + sc(10);
-            let mut bx = pad;
+            let y = s.head_rc.bottom + sc(4);
             s.btns.clear();
+            let by = if s.reply {
+                // the message being replied to (dim), then two columns: input | AI version with a copy icon
+                s.quote_rc = RECT { left: pad, top: y, right: width - pad, bottom: y + quote_h };
+                let y = s.quote_rc.bottom + sc(8);
+                let box_h = (body_h + sc(12)).clamp(sc(110), sc(320));
+                s.edit_rc = RECT { left: pad, top: y, right: pad + col_w, bottom: y + box_h };
+                s.out_rc = RECT { left: width - pad - col_w, top: y, right: width - pad, bottom: y + box_h };
+                let o = s.out_rc;
+                s.body_rc = RECT { left: o.left + sc(10), top: o.top + sc(6), right: o.right - sc(10) - copy_w, bottom: o.bottom - sc(6) };
+                let c = RECT { left: o.right - sc(4) - copy_w, top: o.top + sc(4), right: o.right - sc(4), bottom: o.top + sc(4) + copy_w };
+                s.btns.push((c, B_COPY, "\u{e8c8}".into())); // MDL2 "Copy"
+                y + box_h + sc(10)
+            } else {
+                s.body_rc = RECT { left: pad, top: y, right: width - pad, bottom: y + body_h };
+                s.body_rc.bottom + sc(10)
+            };
+            let mut bx = pad;
             for ((id, l), bw) in specs.into_iter().zip(widths) {
                 s.btns.push((RECT { left: bx, top: by, right: bx + bw, bottom: by + btn_h }, id, l));
                 bx += bw + gap;
@@ -1355,6 +1404,10 @@ fn layout(show: bool) {
                 s.body_rc.bottom + pad
             } else {
                 s.btns.push((RECT { left: width - pad - close_w, top: by, right: width - pad, bottom: by + btn_h }, B_CLOSE, "✕".into()));
+                if reply_w > 0 {
+                    let rx = width - pad - close_w - gap - reply_w;
+                    s.btns.push((RECT { left: rx, top: by, right: rx + reply_w, bottom: by + btn_h }, B_REPLY, reply_l.into()));
+                }
                 by + btn_h + pad
             };
             let r = mi.rcWork;
@@ -1363,17 +1416,99 @@ fn layout(show: bool) {
             if show {
                 s.visible = true;
             }
-            (nx, ny, width, height)
+            let e = s.edit_rc;
+            let ed = s.reply.then(|| (e.left + sc(10), e.top + sc(6), e.right - e.left - sc(20), e.bottom - e.top - sc(12), s.fonts[1]));
+            (nx, ny, width, height, ed)
         });
         let flags = SWP_NOACTIVATE | if show { SWP_SHOWWINDOW } else { 0 };
         SetWindowPos(hwnd, HWND_TOPMOST, x, y, width, height, flags);
+        if let Some((ex, ey, ew, eh, font)) = ed {
+            SendMessageW(edit(), WM_SETFONT, font as usize, 0);
+            MoveWindow(edit(), ex, ey, ew, eh, 1);
+            ShowWindow(edit(), SW_SHOWNA);
+        }
         InvalidateRect(hwnd, null(), 0);
     }
 }
 
 fn hide() {
-    st(|s| s.visible = false);
-    unsafe { ShowWindow(popup(), SW_HIDE) };
+    let (reply, src) = st(|s| {
+        let r = s.reply;
+        s.reply = false;
+        s.visible = false;
+        (r, s.src)
+    });
+    unsafe {
+        let h = popup();
+        let had_focus = GetForegroundWindow() == h;
+        ShowWindow(h, SW_HIDE);
+        if reply {
+            ShowWindow(edit(), SW_HIDE);
+            SetWindowLongPtrW(h, GWL_EXSTYLE, GetWindowLongPtrW(h, GWL_EXSTYLE) | WS_EX_NOACTIVATE as isize);
+            if had_focus && src != 0 {
+                SetForegroundWindow(src as HWND); // back to the chat, ready to paste the reply
+            }
+        }
+    }
+}
+
+/// Reply mode: an input box under the translation; what the user types (VI or EN) is written in EN or 中文.
+fn reply_start() {
+    st(|s| {
+        s.reply = true;
+        s.quote = if s.result.is_empty() { s.body.clone() } else { s.result.clone() };
+        // answer in the language of the message: Chinese if it has Han characters, else English
+        s.target = if s.text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) { 2 } else { 1 };
+        s.text.clear();
+        s.image = None;
+        s.result.clear();
+        s.error = false;
+        s.busy = false;
+        s.rid += 1; // a translation still streaming in is dropped
+        s.head = "Trả lời · gõ tiếng Việt hoặc English · Enter = viết · Shift+Enter = xuống dòng".into();
+        s.body.clear();
+    });
+    unsafe {
+        let h = popup();
+        // the popup must take focus so the user can type in it
+        SetWindowLongPtrW(h, GWL_EXSTYLE, GetWindowLongPtrW(h, GWL_EXSTYLE) & !(WS_EX_NOACTIVATE as isize));
+        SetWindowTextW(edit(), w("").as_ptr());
+        layout(true);
+        SetForegroundWindow(h);
+        SetFocus(edit());
+    }
+}
+
+fn reply_send() {
+    let text = unsafe {
+        let n = GetWindowTextLengthW(edit());
+        let mut b = vec![0u16; n as usize + 1];
+        let n = GetWindowTextW(edit(), b.as_mut_ptr(), n + 1);
+        String::from_utf16_lossy(&b[..n as usize]).replace("\r\n", "\n").trim().to_string()
+    };
+    if text.is_empty() || text.chars().count() > MAX_CHARS {
+        return;
+    }
+    st(|s| s.text = text);
+    run();
+}
+
+/// The reply box: Enter writes the reply, Shift+Enter is a new line, Ctrl+A selects all.
+unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
+    let shift = GetKeyState(VK_SHIFT as i32) < 0;
+    match msg {
+        WM_KEYDOWN if wp == VK_RETURN as usize && !shift => {
+            reply_send();
+            return 0;
+        }
+        WM_KEYDOWN if wp == b'A' as usize && GetKeyState(VK_CONTROL as i32) < 0 => {
+            SendMessageW(hwnd, EM_SETSEL, 0, -1);
+            return 0;
+        }
+        WM_CHAR if (wp == 0x0d && !shift) || wp == 0x01 => return 0, // the Enter / Ctrl+A characters: no beep, no line
+        _ => {}
+    }
+    CallWindowProcW(std::mem::transmute::<isize, WNDPROC>(EDIT_PROC.load(Ordering::Relaxed)), hwnd, msg, wp, lp)
 }
 
 fn in_popup(x: i32, y: i32) -> bool {
@@ -1396,6 +1531,9 @@ fn show_msg(head: &str, body: &str, error: bool) {
 }
 
 fn toast(msg: &str) {
+    if st(|s| s.reply) {
+        return; // never replace a reply being written
+    }
     let mut pt = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut pt) };
     st(|s| {
@@ -1435,8 +1573,9 @@ fn run() {
 // ---------------------------------------------------------------- actions
 /// Pet off: every selection in `apps` is translated. Pet on: only after the pet was clicked (any app).
 fn on_select(x: i32, y: i32) {
-    let (paused, pet_on, armed, snip) = st(|s| (s.paused, s.cfg.pet, s.armed, s.snip_end.is_some_and(|t| t.elapsed().as_millis() < 500)));
-    if paused || (pet_on && !armed) || snip || snip_active() || in_popup(x, y) || in_pet(x, y) {
+    let (paused, pet_on, armed, snip, reply) =
+        st(|s| (s.paused, s.cfg.pet, s.armed, s.snip_end.is_some_and(|t| t.elapsed().as_millis() < 500), s.reply));
+    if paused || reply || (pet_on && !armed) || snip || snip_active() || in_popup(x, y) || in_pet(x, y) {
         return;
     }
     let fg = unsafe { GetForegroundWindow() };
@@ -1493,7 +1632,7 @@ fn on_text(src: isize, x: i32, y: i32, raw: String) {
         return;
     }
     let skip = st(|s| {
-        if s.visible && s.text == text {
+        if s.reply || (s.visible && s.text == text) {
             return true;
         }
         s.src = src;
@@ -1557,11 +1696,11 @@ fn model_menu() {
         let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_NONOTIFY, pt.x, pt.y, 0, hwnd, null()) as usize;
         DestroyMenu(m);
         PostMessageW(hwnd, WM_NULL, 0, 0);
-        let src = st(|s| {
+        let (src, reply) = st(|s| {
             s.menu_open = false;
-            s.src
+            (s.src, s.reply)
         });
-        if src != 0 {
+        if src != 0 && !reply {
             SetForegroundWindow(src as HWND); // focus back to the chat so "Dán thay" still works
         }
         let changed = st(|s| {
@@ -1589,7 +1728,12 @@ fn click(id: u32) {
             let r = st(|s| s.result.clone());
             if !r.is_empty() {
                 clip_set(&r);
-                st(|s| s.head = "Đã copy".into());
+                st(|s| {
+                    s.head = "Đã copy".into();
+                    if s.reply {
+                        s.btns.iter_mut().filter(|b| b.1 == B_COPY).for_each(|b| b.2 = "\u{e73e}".into()); // MDL2 check mark
+                    }
+                });
                 unsafe { InvalidateRect(popup(), null(), 0) };
             }
         }
@@ -1612,12 +1756,17 @@ fn click(id: u32) {
             hide();
         }
         B_CLOSE => hide(),
+        B_REPLY => reply_start(),
+        B_SEND => reply_send(),
         t if (B_VI..B_VI + TARGETS.len() as u32).contains(&t) => {
-            let go = st(|s| {
+            let (go, reply) = st(|s| {
                 s.target = (t - B_VI) as usize;
-                !s.text.is_empty()
+                (!s.text.is_empty(), s.reply)
             });
-            if go {
+            if reply {
+                unsafe { InvalidateRect(popup(), null(), 0) }; // the new target shows even with an empty box
+                reply_send(); // write what is in the box now
+            } else if go {
                 run();
             }
         }
@@ -1928,20 +2077,32 @@ unsafe fn paint(hwnd: HWND) {
         let draw = |font: isize, color: u32, text: &str, rc: RECT, flags: u32| {
             SelectObject(hdc, font as _);
             SetTextColor(hdc, color);
-            let t: Vec<u16> = text.encode_utf16().collect();
+            let t = w(text); // NUL-terminated, see text_size
             let mut r = rc;
-            DrawTextW(hdc, t.as_ptr() as _, t.len() as i32, &mut r, flags);
+            DrawTextW(hdc, t.as_ptr() as _, t.len() as i32 - 1, &mut r, flags);
         };
         if s.icon != 0 {
             let (x, y, z) = s.icon_at;
             DrawIconEx(hdc, x, y, s.icon as _, z, z, 0, null_mut(), DI_NORMAL);
         }
         draw(s.fonts[0], DIM, &s.head, s.head_rc, DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
+        if s.reply {
+            draw(s.fonts[0], DIM, &s.quote, s.quote_rc, DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
+            FillRect(hdc, &s.edit_rc, s.brushes[1] as _); // input box
+            FillRect(hdc, &s.out_rc, s.brushes[1] as _); // AI version box
+            if s.body.is_empty() {
+                draw(s.fonts[1], DIM, "Bản viết lại hiện ở đây", s.body_rc, DT_WORDBREAK | DT_NOPREFIX);
+            }
+        }
         draw(s.fonts[1], FG, &s.body, s.body_rc, DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
         for (r, id, l) in &s.btns {
             let on = *id == B_VI + s.target as u32;
-            FillRect(hdc, r, s.brushes[if on { 2 } else { 1 }] as _);
-            draw(s.fonts[2], FG, l, *r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
+            let icon = s.reply && *id == B_COPY; // the copy icon in the AI version box
+            // teal, like the armed pet: the main actions stand out (Trả lời; in reply mode Viết and copy)
+            let accent = *id == B_REPLY || icon || (s.reply && *id == B_SEND);
+            FillRect(hdc, r, s.brushes[if accent { 4 } else if on { 2 } else { 1 }] as _);
+            let font = s.fonts[if icon { 3 } else { 2 }];
+            draw(font, if accent { BG } else { FG }, l, *r, DT_CENTER | DT_VCENTER | DT_SINGLELINE | DT_NOPREFIX);
         }
     });
     EndPaint(hwnd, &ps);
@@ -1949,19 +2110,29 @@ unsafe fn paint(hwnd: HWND) {
 
 unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
-        WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT, // keep focus (and the selection) in the chat app
+        // keep focus (and the selection) in the chat app; in reply mode the popup takes focus for typing
+        WM_MOUSEACTIVATE => return if st(|s| s.reply) { MA_ACTIVATE } else { MA_NOACTIVATE } as LRESULT,
         WM_ERASEBKGND => return 1,
         WM_PAINT => paint(hwnd),
+        WM_CTLCOLOREDIT => {
+            SetTextColor(wp as HDC, FG);
+            SetBkColor(wp as HDC, BTN);
+            return EDIT_BG.load(Ordering::Relaxed);
+        }
         WM_LBUTTONUP => {
             let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
             let hit = st(|s| s.btns.iter().find(|(r, _, _)| x >= r.left && x < r.right && y >= r.top && y < r.bottom).map(|b| b.1));
             if let Some(id) = hit {
                 click(id);
             }
+            if st(|s| s.reply) {
+                SetFocus(edit()); // keep typing after a button
+            }
         }
         WM_DOWN => {
             let (x, y) = unpack(lp);
-            if st(|s| s.visible && !s.menu_open) && !in_popup(x, y) && !in_pet(x, y) {
+            // a click outside closes a translation, never a reply being written (only ✕ does)
+            if st(|s| s.visible && !s.menu_open && !s.reply) && !in_popup(x, y) && !in_pet(x, y) {
                 hide();
             }
         }
@@ -2205,23 +2376,36 @@ fn main() {
             WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
             cls.as_ptr(),
             title.as_ptr(),
-            WS_POPUP,
+            WS_POPUP | WS_CLIPCHILDREN,
             0, 0, 10, 10,
             null_mut(), null_mut(), hinst, null::<c_void>(),
         );
         POPUP.store(hwnd as isize, Ordering::Relaxed);
+        let ed = CreateWindowExW(
+            0,
+            w("EDIT").as_ptr(),
+            null(),
+            WS_CHILD | ES_MULTILINE as u32 | ES_AUTOVSCROLL as u32,
+            0, 0, 10, 10,
+            hwnd, null_mut(), hinst, null::<c_void>(),
+        );
+        SendMessageW(ed, EM_LIMITTEXT, MAX_CHARS, 0);
+        EDIT_PROC.store(SetWindowLongPtrW(ed, GWLP_WNDPROC, edit_proc as *const () as isize), Ordering::Relaxed);
+        EDIT.store(ed as isize, Ordering::Relaxed);
 
         let (tx, rx) = mpsc::channel();
         let c1 = cfg.clone();
         thread::spawn(move || worker(rx, c1));
         load_codex_list(cfg.clone());
-        let brushes = [BG, BTN, BTN_ON, BORDER].map(|c| CreateSolidBrush(c) as isize);
+        let brushes = [BG, BTN, BTN_ON, BORDER, SNIP_EDGE].map(|c| CreateSolidBrush(c) as isize);
+        EDIT_BG.store(brushes[1], Ordering::Relaxed);
         STATE.with(|c| {
             *c.borrow_mut() = Some(State {
                 cfg, tx, visible: false, paused: false, menu_open: false, armed: false, busy: false,
                 t0: Instant::now(), pet_drag: None, rid: 0, toast_rid: 0,
-                text: String::new(), image: None, snips: 0, snip_end: None, wrap: Default::default(), target: 0, result: String::new(), head: String::new(), body: String::new(),
-                error: false, src: 0, anchor: (0, 0), cache: HashMap::new(), dpi: 0, fonts: [0; 3], icon: 0,
+                text: String::new(), image: None, snips: 0, snip_end: None, reply: false, quote: String::new(),
+                quote_rc: std::mem::zeroed(), edit_rc: std::mem::zeroed(), out_rc: std::mem::zeroed(), wrap: Default::default(), target: 0, result: String::new(), head: String::new(), body: String::new(),
+                error: false, src: 0, anchor: (0, 0), cache: HashMap::new(), dpi: 0, fonts: [0; 4], icon: 0,
                 icon_at: (0, 0, 0), brushes,
                 head_rc: std::mem::zeroed(), body_rc: std::mem::zeroed(), btns: Vec::new(),
             })
@@ -2263,6 +2447,27 @@ fn main() {
             "Đang chạy · bôi đen trong iMe là dịch · Ctrl+Alt+P bật pet · Ctrl+Alt+T tạm dừng"
         });
 
+        if args.iter().any(|a| a == "--reply-test") {
+            // open reply mode on a fake translation, type, send Enter, then quit: exit code 0 = no crash
+            st(|s| {
+                s.rid += 1;
+                s.anchor = (400, 300);
+                s.text = "你好".into();
+                s.result = "Xin chào".into();
+                s.body = "Xin chào".into();
+            });
+            layout(true);
+            log("reply-test: layout");
+            click(B_REPLY);
+            log("reply-test: reply_start ok");
+            SetWindowTextW(edit(), w("cảm ơn anh").as_ptr());
+            SendMessageW(edit(), WM_KEYDOWN, VK_RETURN as usize, 0);
+            log("reply-test: send ok");
+            thread::spawn(|| {
+                thread::sleep(Duration::from_secs(8));
+                PostMessageW(popup(), WM_HOTKEY, 2, 0);
+            });
+        }
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {
             TranslateMessage(&msg);
