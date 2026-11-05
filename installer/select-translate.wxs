@@ -1,0 +1,50 @@
+﻿<!-- Per-user MSI (no admin): %LOCALAPPDATA%\Programs\SelectTranslate, Start Menu shortcut, autostart (AUTOSTART=0 to skip),
+     launches the app after install, closes it before upgrade/uninstall. Built by build.ps1 (WiX 5): wix build -d Version=x.y.z -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs" xmlns:util="http://wixtoolset.org/schemas/v4/wxs/util">
+  <Package Name="Select Translate" Manufacturer="Select Translate" Version="$(Version)" Scope="perUser"
+           UpgradeCode="694E9658-D470-43AF-B4B8-4754A1871A58">
+    <!-- afterInstallExecute: the old version is removed after the new one is in place, so config.json survives upgrades -->
+    <MajorUpgrade Schedule="afterInstallExecute" DowngradeErrorMessage="A newer version of Select Translate is already installed." />
+    <MediaTemplate EmbedCab="yes" />
+
+    <Icon Id="AppIcon" SourceFile="assets\icon.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon" />
+    <Property Id="ARPNOMODIFY" Value="1" />
+    <Property Id="ARPNOREPAIR" Value="1" />
+    <Property Id="AUTOSTART" Value="1" Secure="yes" />
+
+    <util:CloseApplication Target="select-translate.exe" CloseMessage="yes" TerminateProcess="0" RebootPrompt="no" Timeout="2" />
+
+    <StandardDirectory Id="LocalAppDataFolder">
+      <Directory Id="LocalPrograms" Name="Programs">
+        <Directory Id="INSTALLFOLDER" Name="SelectTranslate">
+          <Component Id="App" Guid="5C1B7A40-3E9D-4F7B-9A2E-6D8C1F4B2A71">
+            <File Id="AppExe" Source="target\release\select-translate.exe" />
+            <File Source="README.md" />
+            <RemoveFile Id="Config" Name="config.json" On="uninstall" />
+            <RemoveFolder Id="RmInstall" On="uninstall" />
+            <RemoveFolder Id="RmPrograms" Directory="LocalPrograms" On="uninstall" />
+            <RegistryValue Root="HKCU" Key="Software\SelectTranslate" Name="App" Value="[INSTALLFOLDER]" KeyPath="yes" />
+          </Component>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <StandardDirectory Id="ProgramMenuFolder">
+      <Component Id="MenuShortcut">
+        <Shortcut Name="Select Translate" Target="[INSTALLFOLDER]select-translate.exe" WorkingDirectory="INSTALLFOLDER" Icon="AppIcon"
+                  Description="Select text to translate VI / EN / ZH with Claude or Codex" />
+        <RegistryValue Root="HKCU" Key="Software\SelectTranslate" Name="Shortcut" Value="1" KeyPath="yes" />
+      </Component>
+      <Component Id="Autostart" Condition="AUTOSTART = &quot;1&quot;">
+        <RegistryValue Root="HKCU" Key="Software\Microsoft\Windows\CurrentVersion\Run" Name="Select Translate"
+                       Value="&quot;[INSTALLFOLDER]select-translate.exe&quot;" KeyPath="yes" />
+      </Component>
+    </StandardDirectory>
+
+    <CustomAction Id="LaunchApp" FileRef="AppExe" ExeCommand="" Return="asyncNoWait" />
+    <InstallExecuteSequence>
+      <Custom Action="LaunchApp" After="InstallFinalize" Condition="NOT REMOVE" />
+    </InstallExecuteSequence>
+  </Package>
+</Wix>
