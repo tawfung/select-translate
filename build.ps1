@@ -48,11 +48,12 @@ if (-not (Test-Path $wix)) {
     if ($LASTEXITCODE) { exit $LASTEXITCODE }
     & $wix extension add WixToolset.Util.wixext/5.0.2
 }
-$msi = "dist\select-translate-$ver-x64.msi"
+# Asset names carry no version, so README links to releases/latest/download/<name> keep working
+$msi = "dist\select-translate-x64.msi"
 & $wix build installer\select-translate.wxs -ext WixToolset.Util.wixext -d Version=$ver -arch x64 -o $msi
 if ($LASTEXITCODE) { exit $LASTEXITCODE }
 Remove-Item dist\*.wixpdb -ErrorAction SilentlyContinue
 "release: $msi  $((Get-Item $msi).Length) bytes"
-$zip = "dist\select-translate-$ver-portable.zip"
+$zip = "dist\select-translate-portable.zip"
 Compress-Archive $exe, README.md $zip -Force
 "release: $zip  $((Get-Item $zip).Length) bytes"
