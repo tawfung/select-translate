@@ -50,6 +50,68 @@ struct Config {
     pet: bool,             // true: click the pet, then select = translate (any app); false: every selection in `apps`
     pet_x: Option<i32>,    // pet position (screen pixels); null = bottom-right corner
     pet_y: Option<i32>,
+    hotkeys: Hotkeys,
+}
+
+/// Global shortcuts, e.g. "Ctrl+Alt+D", "Ctrl+Shift+F9", "Win+Alt+T"; "" = off. Read at start-up.
+#[derive(Serialize, Deserialize, Clone)]
+#[serde(default)]
+struct Hotkeys {
+    arm: String,   // translate selections in every app on/off (= click on the pet)
+    snip: String,  // translate a screen region
+    pet: String,   // show/hide the pet
+    pause: String, // pause everything
+    quit: String,
+}
+
+impl Default for Hotkeys {
+    fn default() -> Self {
+        Hotkeys { arm: "Ctrl+Alt+D".into(), snip: "Ctrl+Alt+S".into(), pet: "Ctrl+Alt+P".into(), pause: "Ctrl+Alt+T".into(), quit: "Ctrl+Alt+Q".into() }
+    }
+}
+
+/// "Ctrl+Shift+D" -> (MOD_CONTROL|MOD_SHIFT, 'D'). Keys: A-Z, 0-9, F1-F24, Space, Insert, Delete, Home, End, PageUp, PageDown, Pause.
+fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
+    let (mut mods, mut vk) = (0u32, None);
+    for part in s.split('+').map(|p| p.trim().to_ascii_lowercase()) {
+        match part.as_str() {
+            "ctrl" | "control" => mods |= MOD_CONTROL,
+            "alt" => mods |= MOD_ALT,
+            "shift" => mods |= MOD_SHIFT,
+            "win" | "windows" => mods |= MOD_WIN,
+            k if vk.is_none() => {
+                vk = Some(match k {
+                    "space" => VK_SPACE,
+                    "insert" | "ins" => VK_INSERT,
+                    "delete" | "del" => VK_DELETE,
+                    "home" => VK_HOME,
+                    "end" => VK_END,
+                    "pageup" | "pgup" => VK_PRIOR,
+                    "pagedown" | "pgdn" => VK_NEXT,
+                    "pause" => VK_PAUSE,
+                    _ if k.len() == 1 && k.as_bytes()[0].is_ascii_alphanumeric() => k.as_bytes()[0].to_ascii_uppercase() as u16,
+                    _ => match k.strip_prefix('f').and_then(|n| n.parse::<u16>().ok()) {
+                        Some(n @ 1..=24) => VK_F1 + n - 1,
+                        _ => return None,
+                    },
+                } as u32)
+            }
+            _ => return None, // two keys, or an unknown word
+        }
+    }
+    vk.map(|k| (mods, k))
+}
+
+#[test]
+fn hotkey_parse_ok() {
+    assert_eq!(parse_hotkey("Ctrl+Shift+d"), Some((MOD_CONTROL | MOD_SHIFT, b'D' as u32)));
+    assert_eq!(parse_hotkey(" alt + F9 "), Some((MOD_ALT, VK_F9 as u32)));
+    assert_eq!(parse_hotkey("Win+Space"), Some((MOD_WIN, VK_SPACE as u32)));
+    assert_eq!(parse_hotkey("Ctrl+Alt+7"), Some((MOD_CONTROL | MOD_ALT, b'7' as u32)));
+    assert_eq!(parse_hotkey("Ctrl+Alt"), None);
+    assert_eq!(parse_hotkey("Ctrl+Q+W"), None);
+    assert_eq!(parse_hotkey("Ctrl+F25"), None);
+    assert_eq!(parse_hotkey("Ctrl+Esc"), None);
 }
 
 impl Default for Config {
@@ -66,6 +128,7 @@ impl Default for Config {
             pet: true,
             pet_x: None,
             pet_y: None,
+            hotkeys: Hotkeys::default(),
         }
     }
 }
@@ -706,7 +769,7 @@ fn tray(op: u32) {
         d.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
         d.uCallbackMessage = WM_TRAY;
         d.hIcon = TRAY_ICON.load(Ordering::Relaxed) as _;
-        let tip = if st(|s| s.paused) { "Select Translate — tạm dừng (Ctrl+Alt+T)" } else { "Select Translate — bôi đen để dịch" };
+        let tip = if st(|s| s.paused) { "Select Translate — tạm dừng" } else { "Select Translate — bôi đen để dịch" };
         for (i, c) in tip.encode_utf16().take(127).enumerate() {
             d.szTip[i] = c;
         }
@@ -720,7 +783,34 @@ fn toggle_pause() {
         s.paused
     });
     tray(NIM_MODIFY);
-    toast(if paused { "Đã TẮT dịch bôi đen (Ctrl+Alt+T để bật)" } else { "Đã BẬT dịch bôi đen" });
+    toast(&if paused { format!("Đã TẠM DỪNG{}", key_hint(&keys().pause, " để bật lại")) } else { "Đã chạy lại".into() });
+}
+
+fn keys() -> Hotkeys {
+    st(|s| s.cfg.hotkeys.clone())
+}
+
+/// " · Ctrl+Alt+T<what>" for a notice; "" when that shortcut is off.
+fn key_hint(k: &str, what: &str) -> String {
+    if k.is_empty() { String::new() } else { format!(" · {k}{what}") }
+}
+
+/// Registers the shortcuts from config.json; returns the ones that are invalid or taken by another app.
+fn register_hotkeys(hwnd: HWND) -> Vec<String> {
+    let k = keys();
+    let mut bad = Vec::new();
+    // ids: 1 pause, 2 quit, 3 pet, 4 snip, 5 arm (see WM_HOTKEY)
+    for (id, name, s) in [(1, "pause", &k.pause), (2, "quit", &k.quit), (3, "pet", &k.pet), (4, "snip", &k.snip), (5, "arm", &k.arm)] {
+        if s.trim().is_empty() {
+            continue;
+        }
+        let ok = parse_hotkey(s).is_some_and(|(m, vk)| unsafe { RegisterHotKey(hwnd, id, m | MOD_NOREPEAT, vk) } != 0);
+        if !ok {
+            log(&format!("hotkey {name}={s:?} invalid or taken"));
+            bad.push(format!("{name}: {s}"));
+        }
+    }
+    bad
 }
 
 fn tray_menu() {
@@ -734,17 +824,19 @@ fn tray_menu() {
         };
         add(MF_STRING | MF_GRAYED, 0, &format!("Select Translate · {}", head.trim_end_matches(" · → VI")));
         add(MF_SEPARATOR, 0, "");
-        add(MF_STRING, 7, "Dịch ảnh: chọn vùng màn hình…\tCtrl+Alt+S");
+        let k = keys();
+        add(MF_STRING, 7, &format!("Dịch ảnh: chọn vùng màn hình…\t{}", k.snip));
         add(MF_SEPARATOR, 0, "");
-        let pet_on = st(|s| s.cfg.pet);
-        add(MF_STRING | if pet_on { MF_CHECKED } else { 0 }, 4, "Pet: click pet rồi bôi đen mới dịch\tCtrl+Alt+P");
-        add(MF_STRING | if paused { MF_CHECKED } else { 0 }, 1, "Tạm dừng\tCtrl+Alt+T");
+        let (pet_on, armed) = st(|s| (s.cfg.pet, s.armed));
+        add(MF_STRING | if armed { MF_CHECKED } else { 0 }, 8, &format!("Dịch bôi đen ở mọi app (= click pet)\t{}", k.arm));
+        add(MF_STRING | if pet_on { MF_CHECKED } else { 0 }, 4, &format!("Pet: click pet rồi bôi đen mới dịch\t{}", k.pet));
+        add(MF_STRING | if paused { MF_CHECKED } else { 0 }, 1, &format!("Tạm dừng\t{}", k.pause));
         add(MF_STRING, 2, "Model / effort…");
-        add(MF_STRING, 3, "Mở config.json");
+        add(MF_STRING, 3, "Mở config.json (đổi phím tắt: mục hotkeys)");
         add(MF_STRING, 5, "Đăng nhập / đổi tài khoản Claude…");
         add(MF_STRING, 6, "Đăng nhập / đổi tài khoản Codex…");
         add(MF_SEPARATOR, 0, "");
-        add(MF_STRING, 9, "Thoát\tCtrl+Alt+Q");
+        add(MF_STRING, 9, &format!("Thoát\t{}", k.quit));
         let mut pt = POINT { x: 0, y: 0 };
         GetCursorPos(&mut pt);
         SetForegroundWindow(hwnd);
@@ -755,6 +847,7 @@ fn tray_menu() {
             1 => toggle_pause(),
             4 => toggle_pet(),
             7 => snip_start(),
+            8 => hotkey_arm(),
             2 => model_menu(),
             3 => {
                 let _ = Command::new("notepad.exe").arg(cfg_path()).spawn();
@@ -972,6 +1065,17 @@ fn pet_click() {
     });
     tray(NIM_MODIFY);
     pet_draw();
+}
+
+/// Hotkey "arm" (default Ctrl+Alt+D): same as a click on the pet, with a notice (the pet may be off or out of sight).
+fn hotkey_arm() {
+    pet_click();
+    let (armed, pet_on, k) = st(|s| (s.armed, s.cfg.pet, s.cfg.hotkeys.arm.clone()));
+    toast(&match (armed, pet_on) {
+        (true, _) => format!("Đã BẬT dịch bôi đen ở mọi app{}", key_hint(&k, " để tắt")),
+        (false, true) => format!("Đã TẮT dịch bôi đen{}", key_hint(&k, " để bật")),
+        (false, false) => format!("Chỉ dịch bôi đen trong app đã chọn (config.json){}", key_hint(&k, " để dịch mọi app")),
+    });
 }
 
 fn toggle_pet() {
@@ -2205,6 +2309,8 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 toggle_pet();
             } else if wp == 4 {
                 snip_start();
+            } else if wp == 5 {
+                hotkey_arm();
             } else if wp == 2 {
                 DestroyWindow(hwnd);
             }
@@ -2412,10 +2518,7 @@ fn main() {
         });
         SetWindowsHookExW(WH_MOUSE_LL, Some(hook), hinst, 0);
         SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_hook), hinst, 0);
-        RegisterHotKey(hwnd, 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, b'T' as u32);
-        RegisterHotKey(hwnd, 2, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, b'Q' as u32);
-        RegisterHotKey(hwnd, 3, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, b'P' as u32);
-        RegisterHotKey(hwnd, 4, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, b'S' as u32);
+        let bad_keys = register_hotkeys(hwnd);
         TRAY_ICON.store(app_icon(GetSystemMetrics(SM_CXSMICON)), Ordering::Relaxed);
         tray(NIM_ADD);
 
@@ -2441,10 +2544,13 @@ fn main() {
         if pet_on {
             pet_show(true);
         }
-        toast(if pet_on {
-            "Đang chạy · click pet = bật/tắt dịch bôi đen · chuột phải pet = dịch ảnh · Ctrl+Alt+P tắt pet"
+        let k = keys();
+        toast(&if !bad_keys.is_empty() {
+            format!("Phím tắt sai hoặc đã bị app khác dùng: {} · sửa mục hotkeys trong config.json rồi mở lại tool", bad_keys.join(", "))
+        } else if pet_on {
+            format!("Đang chạy · click pet = bật/tắt dịch bôi đen · chuột phải pet = dịch ảnh{}", key_hint(&k.pet, " tắt pet"))
         } else {
-            "Đang chạy · bôi đen trong iMe là dịch · Ctrl+Alt+P bật pet · Ctrl+Alt+T tạm dừng"
+            format!("Đang chạy · bôi đen trong iMe là dịch{}{}", key_hint(&k.pet, " bật pet"), key_hint(&k.pause, " tạm dừng"))
         });
 
         if args.iter().any(|a| a == "--reply-test") {

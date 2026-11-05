@@ -34,7 +34,7 @@ Dùng luôn tài khoản Claude/ChatGPT đã đăng nhập trên máy, không c�
 - **Trả lời nhanh**: bấm **↩ Trả lời** dưới bản dịch, gõ câu trả lời bằng tiếng Việt hoặc English rồi Enter, AI viết lại sang EN hoặc 中文 (tự chọn theo ngôn ngữ tin nhắn gốc) ở khung bên cạnh, bấm icon copy là dán được vào chat. Popup trả lời chỉ đóng khi bấm ✕, click ra ngoài không mất bản nháp.
 - **Dán thay**: thay đoạn đang bôi đen bằng bản dịch, rất tiện khi soạn tin nhắn.
 - **Chọn model tuỳ ý**: đổi giữa Claude và Codex, model và mức effort ngay trên popup; danh sách model lấy theo tài khoản của bạn.
-- **Pet nhỏ ở góc màn hình**: click để bật dịch, click lần nữa để tắt; kéo đi đâu cũng được.
+- **Pet nhỏ ở góc màn hình**: click (hoặc `Ctrl+Alt+D`) để bật dịch, lần nữa để tắt; kéo đi đâu cũng được.
 - **Bôi đen bằng chuột hay bàn phím đều nhận**: kéo, double/triple-click, Shift+click, Shift + phím mũi tên, Ctrl+A.
 - **Không làm phiền**: popup không lấy focus của ô chat, clipboard được trả lại như cũ.
 
@@ -65,10 +65,19 @@ Gỡ cài đặt: *Settings → Apps → Select Translate → Uninstall*.
 
 | Phím tắt | Tác dụng |
 |---|---|
+| `Ctrl+Alt+D` | Bật/tắt dịch bôi đen ở mọi app (như click pet) |
 | `Ctrl+Alt+S` | Dịch ảnh: kéo chọn vùng màn hình (Esc để huỷ) |
 | `Ctrl+Alt+P` | Bật/tắt pet |
 | `Ctrl+Alt+T` | Tạm dừng |
 | `Ctrl+Alt+Q` | Thoát |
+
+Đổi phím tắt trong `config.json` (menu khay → *Mở config.json*), mục `hotkeys`, rồi mở lại tool. Để `""` là tắt phím đó. Phím bị app khác giữ thì tool báo khi khởi động.
+
+```json
+"hotkeys": { "arm": "Ctrl+Shift+F1", "snip": "Ctrl+Alt+S", "pet": "Ctrl+Alt+P", "pause": "Ctrl+Alt+T", "quit": "" }
+```
+
+Phím hợp lệ: `Ctrl`, `Alt`, `Shift`, `Win` + một phím A–Z, 0–9, F1–F24, Space, Insert, Delete, Home, End, PageUp, PageDown, Pause.
 
 Popup dịch tự đóng khi click ra ngoài; popup trả lời (Enter = viết, Shift+Enter = xuống dòng) chỉ đóng bằng ✕.
 
