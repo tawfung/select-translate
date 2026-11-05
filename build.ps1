@@ -1,4 +1,7 @@
 # Build select-translate.exe, embed assets\icon.ico, copy to dist\.   Run: powershell -NoProfile -File build.ps1
+# Needs: Rust stable-x86_64-pc-windows-gnu, .NET SDK 6+ (WiX 5 for the MSI).
+# New release: bump version in Cargo.toml first (the MSI only upgrades over a lower version),
+# then attach dist\select-translate-x64.msi + dist\select-translate-portable.zip to a GitHub release (keep the names).
 # (GNU toolchain: this machine has no Windows SDK for MSVC, and rust-mingw ships no windres,
 #  so the icon goes in after linking with the Win32 UpdateResource API.)
 $ErrorActionPreference = 'Stop'
