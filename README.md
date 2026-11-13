@@ -90,3 +90,5 @@ Click pet để bật/tắt dịch bôi đen, chuột phải vào pet để dị
 ## Quyền riêng tư
 
 Chữ bạn bôi đen chỉ được gửi tới Claude (Anthropic) hoặc ChatGPT (OpenAI) qua tài khoản của chính bạn. Tool không có server riêng và không lưu lại nội dung đã dịch.
+
+Mỗi ngày một lần (lần chạy đầu tiên trong ngày), tool tải trang danh sách model công khai của Anthropic (`platform.claude.com`) bằng `curl.exe` có sẵn trong Windows để menu Model luôn có model Claude mới nhất. Yêu cầu này không kèm dữ liệu nào của bạn; không có mạng thì tool dùng danh sách đã lưu.

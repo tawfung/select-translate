@@ -19,10 +19,10 @@ use std::{
     io::{BufRead, BufReader, Write},
     os::windows::process::CommandExt,
     path::PathBuf,
-    process::{Child, ChildStdin, ChildStdout, Command, Stdio},
+    process::{Child, ChildStdin, Command, Stdio},
     ptr::{null, null_mut},
     sync::{
-        atomic::{AtomicIsize, Ordering},
+        atomic::{AtomicIsize, AtomicU32, AtomicU64, Ordering},
         mpsc, Mutex,
     },
     thread,
@@ -31,7 +31,7 @@ use std::{
 use windows_sys::Win32::{
     Foundation::*,
     Graphics::Gdi::*,
-    System::{Console::*, DataExchange::*, LibraryLoader::GetModuleHandleW, Memory::*, Threading::*},
+    System::{Console::*, DataExchange::*, LibraryLoader::GetModuleHandleW, Memory::*, SystemInformation::GetLocalTime, Threading::*},
     UI::{HiDpi::*, Input::KeyboardAndMouse::*, Shell::*, WindowsAndMessaging::*},
 };
 
@@ -173,8 +173,10 @@ fn workdir() -> PathBuf {
     d
 }
 
-// ponytail: hand list of newest Claude IDs (CLI aliases lag behind); add new IDs when they ship
-const CLAUDE_LATEST: [&str; 4] = ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-1"];
+// Newest Claude IDs (CLI aliases lag behind). This built-in list is only the fallback: once a day the
+// IDs on Anthropic's public models page replace it (refresh_models).
+const CLAUDE_LATEST: [&str; 4] = ["claude-sonnet-5-5", "claude-opus-5-5", "claude-haiku-5-5", "claude-fable-5-2"];
+const MODELS_URL: &str = "https://platform.claude.com/docs/en/about-claude/models/overview.md";
 const EFFORTS_CLAUDE: [&str; 3] = ["low", "medium", "high"];
 const EFFORTS_CODEX: [&str; 4] = ["minimal", "low", "medium", "high"];
 const TARGETS: [(&str, &str); 3] = [("VI", "Vietnamese"), ("EN", "English"), ("中文", "Simplified Chinese")];
@@ -288,6 +290,79 @@ fn codex_env(c: &mut Command, exe: &std::path::Path) {
     }
 }
 
+// ---------------------------------------------------------------- newest Claude IDs, read once a day
+/// "-12rest" -> (12, "rest"); one or two digits only (a date such as -20250929 is not a version part).
+fn ver_part(s: &str) -> Option<(u32, &str)> {
+    let s = s.strip_prefix('-')?;
+    let n = s.bytes().take_while(u8::is_ascii_digit).count();
+    (1..=2).contains(&n).then(|| (s[..n].parse().unwrap_or(0), &s[n..]))
+}
+
+/// The newest "claude-<family>-<major>-<minor>" of each family named in a page, in page order.
+fn parse_models(page: &str) -> Vec<String> {
+    let mut best: Vec<(String, u32, u32)> = Vec::new();
+    for s in page.split("claude-").skip(1) {
+        let fam: String = s.chars().take_while(char::is_ascii_lowercase).collect();
+        let Some((major, rest)) = ver_part(&s[fam.len()..]) else { continue };
+        let Some((minor, _)) = ver_part(rest) else { continue };
+        if fam.is_empty() {
+            continue;
+        }
+        match best.iter_mut().find(|b| b.0 == fam) {
+            Some(b) => {
+                if (major, minor) > (b.1, b.2) {
+                    (b.1, b.2) = (major, minor);
+                }
+            }
+            None => best.push((fam, major, minor)),
+        }
+    }
+    best.into_iter().map(|(f, a, b)| format!("claude-{f}-{a}-{b}")).collect()
+}
+
+#[test]
+fn parse_models_ok() {
+    let page = "| `claude-opus-5-5` | claude-sonnet-4-5-20250929 `claude-sonnet-5-5` claude-3-5-haiku-20241022 \
+                claude-opus-4-20250514 anthropic.claude-haiku-5-5-v1:0 claude-code claude-opus-5-1 claude-";
+    assert_eq!(parse_models(page), ["claude-opus-5-5", "claude-sonnet-5-5", "claude-haiku-5-5"]);
+    assert!(parse_models("no models here").is_empty());
+}
+
+fn models_path() -> PathBuf {
+    workdir().join("models.json") // {"day": 20261113, "claude": ["claude-…", …]}
+}
+fn saved_models() -> Value {
+    fs::read_to_string(models_path()).ok().and_then(|s| serde_json::from_str(&s).ok()).unwrap_or(Value::Null)
+}
+
+/// The newest Claude IDs: the last list read from the models page, else the built-in one.
+fn claude_latest() -> Vec<String> {
+    let list: Vec<String> = saved_models()["claude"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(str::to_string)).collect();
+    if list.is_empty() { CLAUDE_LATEST.iter().map(|s| s.to_string()).collect() } else { list }
+}
+
+/// First start (or first Model menu) of the day: read Anthropic's public models page in the background and
+/// save its newest IDs. Offline, or a page without IDs: the old list stays and the next call tries again.
+fn refresh_models() {
+    let mut t: SYSTEMTIME = unsafe { std::mem::zeroed() };
+    unsafe { GetLocalTime(&mut t) };
+    let day = t.wYear as u64 * 10000 + t.wMonth as u64 * 100 + t.wDay as u64;
+    if saved_models()["day"].as_u64() == Some(day) {
+        return;
+    }
+    thread::spawn(move || {
+        // curl.exe is part of Windows 10/11: no HTTP library in the exe. The request carries no user data.
+        let out = Command::new("curl.exe").args(["-sfL", "--max-time", "15", MODELS_URL]).stdin(Stdio::null()).creation_flags(NOWIN).output();
+        let ids = out.map(|o| parse_models(&String::from_utf8_lossy(&o.stdout))).unwrap_or_default();
+        if ids.len() < 2 {
+            log("models page: not read (offline, no curl.exe, or the page changed); keeping the old list");
+            return;
+        }
+        log(&format!("models page: {}", ids.join(" ")));
+        let _ = fs::write(models_path(), json!({"day": day, "claude": ids}).to_string());
+    });
+}
+
 // ---------------------------------------------------------------- model lists (per account)
 type Model = (String, String, bool); // id, label, usable
 
@@ -311,7 +386,7 @@ fn claude_models() -> Vec<Model> {
         }
         format!("{n} {}", p.get(2..).map(|r| r.join(".")).unwrap_or_default())
     };
-    let mut out: Vec<Model> = CLAUDE_LATEST
+    let mut out: Vec<Model> = claude_latest()
         .iter()
         .map(|m| {
             let ok = !blocked.contains(&pretty(m));
@@ -343,9 +418,84 @@ fn codex_models(c: &Config) -> Vec<Model> {
 }
 
 // ---------------------------------------------------------------- backends
+const STALL: Duration = Duration::from_secs(90); // no output for this long: the CLI is stuck and gets killed
+const GRACE: Duration = Duration::from_secs(3); // an interrupted turn gets this long to end, else the CLI is killed
+const CANCELLED: &str = "cancelled"; // error of a translation dropped for a newer one (never shown)
+
+/// rid of the newest queued translation: an older one still running is interrupted.
+static NEWEST: AtomicU64 = AtomicU64::new(0);
+
+/// A CLI child process. A thread reads its stdout into a channel, so the worker can wait with a time limit
+/// and look for a newer translation between two lines. Dropping it kills the process.
+struct Proc {
+    ch: Child,
+    stdin: ChildStdin,
+    out: mpsc::Receiver<String>,
+}
+
+enum Wait {
+    Line(Value),
+    Eof,     // the CLI exited
+    Stalled, // no output within the limit
+    Newer,   // a newer translation is queued
+}
+
+impl Proc {
+    fn spawn(mut cmd: Command, stderr_log: &str) -> Result<Proc, String> {
+        let err = fs::File::create(workdir().join(stderr_log)).map_err(|e| e.to_string())?;
+        let mut ch = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(err).spawn().map_err(|e| e.to_string())?;
+        let (stdin, stdout) = (ch.stdin.take().unwrap(), ch.stdout.take().unwrap());
+        let (tx, out) = mpsc::channel();
+        thread::spawn(move || {
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                if tx.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Proc { ch, stdin, out })
+    }
+
+    fn alive(&mut self) -> bool {
+        matches!(self.ch.try_wait(), Ok(None))
+    }
+
+    fn send(&mut self, v: Value) -> bool {
+        self.stdin.write_all((v.to_string() + "\n").as_bytes()).and_then(|_| self.stdin.flush()).is_ok()
+    }
+
+    /// The next JSON line of stdout. `rid` = the translation being read (0: never give way to a newer one).
+    fn read(&self, limit: Duration, rid: u64) -> Wait {
+        let t = Instant::now();
+        loop {
+            if rid != 0 && NEWEST.load(Ordering::Relaxed) != rid {
+                return Wait::Newer;
+            }
+            if t.elapsed() >= limit {
+                return Wait::Stalled;
+            }
+            match self.out.recv_timeout(Duration::from_millis(100)) {
+                Ok(line) => {
+                    if let Ok(v) = serde_json::from_str(&line) {
+                        return Wait::Line(v);
+                    }
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => return Wait::Eof,
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
+            }
+        }
+    }
+}
+
+impl Drop for Proc {
+    fn drop(&mut self) {
+        let _ = self.ch.kill();
+    }
+}
+
 /// One long-lived `claude -p` in stream-json mode: no start-up cost per translation.
 struct Claude {
-    p: Option<(Child, ChildStdin, BufReader<ChildStdout>)>,
+    p: Option<Proc>,
     turns: u32,
     key: (String, String),
     thinking_off_ok: HashMap<String, bool>, // false once a model rejects "thinking disabled"
@@ -357,9 +507,7 @@ impl Claude {
     }
 
     fn close(&mut self) {
-        if let Some((mut ch, _, _)) = self.p.take() {
-            let _ = ch.kill();
-        }
+        self.p = None; // dropping the Proc kills the process
     }
 
     fn start(&mut self, c: &Config) -> Result<(), String> {
@@ -373,21 +521,26 @@ impl Claude {
         if off {
             cmd.args(["--settings", r#"{"alwaysThinkingEnabled":false}"#]).env("MAX_THINKING_TOKENS", "0");
         }
-        let err = fs::File::create(workdir().join("claude-stderr.log")).map_err(|e| e.to_string())?;
-        let mut ch = cmd.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(err).spawn().map_err(|e| e.to_string())?;
-        let (i, o) = (ch.stdin.take().unwrap(), BufReader::new(ch.stdout.take().unwrap()));
-        self.p = Some((ch, i, o));
+        self.p = Some(Proc::spawn(cmd, "claude-stderr.log")?);
         self.turns = 0;
         self.key = (c.claude_model.clone(), c.claude_effort.clone());
         Ok(())
     }
 
-    fn translate(&mut self, c: &Config, msg: &str, img: Option<&std::path::Path>, part: &dyn Fn(&str)) -> Result<String, String> {
-        let r = match self.once(c, msg, img, part) {
+    /// Called after a translation, while idle: start the process the next one needs (the reset after
+    /// RESET_AFTER turns or an image, or after a failure), so the next translation does not wait for it.
+    fn rewarm(&mut self, c: &Config) {
+        if self.p.is_none() || self.turns >= RESET_AFTER {
+            let _ = self.start(c);
+        }
+    }
+
+    fn translate(&mut self, c: &Config, msg: &str, img: Option<&std::path::Path>, rid: u64, part: &dyn Fn(&str)) -> Result<String, String> {
+        let r = match self.once(c, msg, img, rid, part) {
             Err(e) if e.contains("thinking") && self.thinking_off_ok.get(&c.claude_model) != Some(&false) => {
                 self.thinking_off_ok.insert(c.claude_model.clone(), false);
                 self.close();
-                self.once(c, msg, img, part)
+                self.once(c, msg, img, rid, part)
             }
             r => r,
         };
@@ -397,7 +550,7 @@ impl Claude {
         r
     }
 
-    fn once(&mut self, c: &Config, msg: &str, img: Option<&std::path::Path>, part: &dyn Fn(&str)) -> Result<String, String> {
+    fn once(&mut self, c: &Config, msg: &str, img: Option<&std::path::Path>, rid: u64, part: &dyn Fn(&str)) -> Result<String, String> {
         let content = match img {
             Some(p) => {
                 let data = fs::read(p).map_err(|e| e.to_string())?;
@@ -406,48 +559,74 @@ impl Claude {
             }
             None => json!(msg),
         };
-        let alive = match self.p.as_mut() {
-            Some((ch, _, _)) => matches!(ch.try_wait(), Ok(None)),
-            None => false,
-        };
-        if !alive || self.turns >= RESET_AFTER || self.key != (c.claude_model.clone(), c.claude_effort.clone()) {
+        if !self.p.as_mut().is_some_and(Proc::alive) || self.turns >= RESET_AFTER || self.key != (c.claude_model.clone(), c.claude_effort.clone()) {
             self.start(c)?;
         }
         self.turns += 1;
-        let (_, stdin, out) = self.p.as_mut().unwrap();
-        let line = json!({"type": "user", "message": {"role": "user", "content": content}}).to_string() + "\n";
-        if stdin.write_all(line.as_bytes()).and_then(|_| stdin.flush()).is_err() {
+        let p = self.p.as_mut().unwrap();
+        while p.out.try_recv().is_ok() {} // lines left by an interrupted turn
+        if !p.send(json!({"type": "user", "message": {"role": "user", "content": content}})) {
             self.close();
             return Err("Không gửi được tới Claude CLI".into());
         }
         let mut acc = String::new();
-        let mut buf = String::new();
+        let mut stop: Option<(Instant, bool, bool)> = None; // interrupted: when, request acknowledged, turn ended
         loop {
-            buf.clear();
-            if out.read_line(&mut buf).unwrap_or(0) == 0 {
-                self.close();
-                let log = fs::read_to_string(workdir().join("claude-stderr.log")).unwrap_or_default();
-                let last = log.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("Claude CLI đã thoát");
-                return Err(last.to_string());
-            }
-            let Ok(ev) = serde_json::from_str::<Value>(&buf) else { continue };
+            let wait = match stop {
+                Some((t, ..)) => p.read(GRACE.saturating_sub(t.elapsed()), 0),
+                None => p.read(STALL, rid),
+            };
+            let ev = match wait {
+                Wait::Line(v) => v,
+                Wait::Newer => {
+                    // a newer selection: end this turn but keep the process, so the next one starts at once
+                    p.send(json!({"type": "control_request", "request_id": format!("stop{rid}"), "request": {"subtype": "interrupt"}}));
+                    stop = Some((Instant::now(), false, false));
+                    continue;
+                }
+                Wait::Eof | Wait::Stalled if stop.is_some() => {
+                    self.close(); // the interrupt did not end the turn in time
+                    return Err(CANCELLED.into());
+                }
+                Wait::Stalled => {
+                    self.close();
+                    return Err(format!("Claude CLI không trả lời sau {} giây", STALL.as_secs()));
+                }
+                Wait::Eof => {
+                    self.close();
+                    let log = fs::read_to_string(workdir().join("claude-stderr.log")).unwrap_or_default();
+                    let last = log.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("Claude CLI đã thoát");
+                    return Err(last.to_string());
+                }
+            };
             match ev["type"].as_str() {
-                Some("stream_event") => {
+                Some("control_response") => {
+                    if let Some(s) = stop.as_mut() {
+                        s.1 = true;
+                    }
+                }
+                Some("stream_event") if stop.is_none() => {
                     let d = &ev["event"]["delta"];
                     if d["type"] == "text_delta" {
                         acc.push_str(d["text"].as_str().unwrap_or(""));
                         part(&acc);
                     }
                 }
-                Some("result") => {
-                    if ev["is_error"].as_bool() == Some(true) {
-                        self.close();
-                        return Err(ev["result"].as_str().or(ev["subtype"].as_str()).unwrap_or("Claude error").to_string());
+                Some("result") => match stop.as_mut() {
+                    Some(s) => s.2 = true,
+                    None => {
+                        if ev["is_error"].as_bool() == Some(true) {
+                            self.close();
+                            return Err(ev["result"].as_str().or(ev["subtype"].as_str()).unwrap_or("Claude error").to_string());
+                        }
+                        let r = ev["result"].as_str().map(str::to_string).unwrap_or(acc);
+                        return Ok(r.trim().to_string());
                     }
-                    let r = ev["result"].as_str().map(str::to_string).unwrap_or(acc);
-                    return Ok(r.trim().to_string());
-                }
+                },
                 _ => {}
+            }
+            if matches!(stop, Some((_, true, true))) {
+                return Err(CANCELLED.into()); // interrupted cleanly: the process is ready for the next message
             }
         }
     }
@@ -457,7 +636,7 @@ impl Claude {
 /// translation instead of ~5 s for `codex exec`. The thread's base instructions are our SYSTEM prompt
 /// and the agent extras (tools, hooks, MCP, skills, plugins) are switched off: ~7k tokens a turn, mostly cached.
 struct Codex {
-    p: Option<(Child, ChildStdin, BufReader<ChildStdout>)>,
+    p: Option<Proc>,
     thread: String,
     next_id: u64,
     turns: u32,
@@ -481,30 +660,22 @@ impl Codex {
     }
 
     fn close(&mut self) {
-        if let Some((mut ch, _, _)) = self.p.take() {
-            let _ = ch.kill();
-        }
+        self.p = None; // dropping the Proc kills the process
     }
 
     fn send(&mut self, v: Value) -> Result<(), String> {
-        let (_, stdin, _) = self.p.as_mut().ok_or("Codex chưa chạy")?;
-        stdin.write_all((v.to_string() + "\n").as_bytes()).and_then(|_| stdin.flush()).map_err(|e| e.to_string())
+        if self.p.as_mut().is_some_and(|p| p.send(v)) { Ok(()) } else { Err("Không gửi được tới Codex CLI".into()) }
     }
 
-    fn read(&mut self) -> Result<Value, String> {
-        let (_, _, out) = self.p.as_mut().ok_or("Codex chưa chạy")?;
-        let mut buf = String::new();
-        loop {
-            buf.clear();
-            if out.read_line(&mut buf).unwrap_or(0) == 0 {
-                let log = fs::read_to_string(workdir().join("codex-stderr.log")).unwrap_or_default();
-                let last = log.lines().rev().find(|l| l.contains("ERROR")).or(log.lines().last()).unwrap_or("Codex CLI đã thoát");
-                return Err(last.chars().take(300).collect());
-            }
-            if let Ok(v) = serde_json::from_str::<Value>(&buf) {
-                return Ok(v);
-            }
-        }
+    /// Why the CLI exited: the last error line of its stderr log.
+    fn exit_reason() -> String {
+        let log = fs::read_to_string(workdir().join("codex-stderr.log")).unwrap_or_default();
+        let last = log.lines().rev().find(|l| l.contains("ERROR")).or(log.lines().last()).unwrap_or("Codex CLI đã thoát");
+        last.chars().take(300).collect()
+    }
+
+    fn stalled() -> String {
+        format!("Codex CLI không trả lời sau {} giây", STALL.as_secs())
     }
 
     /// Send a request and wait for its response (notifications in between are skipped).
@@ -512,8 +683,13 @@ impl Codex {
         let id = self.next_id;
         self.next_id += 1;
         self.send(json!({"id": id, "method": method, "params": params}))?;
+        let p = self.p.as_ref().ok_or("Codex chưa chạy")?;
         loop {
-            let v = self.read()?;
+            let v = match p.read(STALL, 0) {
+                Wait::Line(v) => v,
+                Wait::Eof => return Err(Self::exit_reason()),
+                _ => return Err(Self::stalled()),
+            };
             if v["id"] == id && v.get("method").is_none() {
                 if let Some(e) = v.get("error") {
                     return Err(e["message"].as_str().unwrap_or("Codex error").to_string());
@@ -534,10 +710,7 @@ impl Codex {
         for s in CODEX_SET {
             command.args(["-c", s]);
         }
-        let err = fs::File::create(workdir().join("codex-stderr.log")).map_err(|e| e.to_string())?;
-        let mut ch = command.stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(err).spawn().map_err(|e| e.to_string())?;
-        let (i, o) = (ch.stdin.take().unwrap(), BufReader::new(ch.stdout.take().unwrap()));
-        self.p = Some((ch, i, o));
+        self.p = Some(Proc::spawn(command, "codex-stderr.log")?);
         let r = (|| {
             self.call("initialize", json!({"clientInfo": {"name": "select-translate", "version": env!("CARGO_PKG_VERSION")}}))?;
             self.send(json!({"method": "initialized"}))?;
@@ -558,12 +731,15 @@ impl Codex {
         Ok(())
     }
 
-    fn translate(&mut self, c: &Config, msg: &str, img: Option<&std::path::Path>, part: &dyn Fn(&str)) -> Result<String, String> {
-        let alive = match self.p.as_mut() {
-            Some((ch, _, _)) => matches!(ch.try_wait(), Ok(None)),
-            None => false,
-        };
-        if !alive || self.turns >= RESET_AFTER || self.key != (c.codex_model.clone(), c.codex_effort.clone()) {
+    /// As Claude::rewarm: start the process (and thread) the next translation needs, while idle.
+    fn rewarm(&mut self, c: &Config) {
+        if self.p.is_none() || self.turns >= RESET_AFTER {
+            let _ = self.start(c);
+        }
+    }
+
+    fn translate(&mut self, c: &Config, msg: &str, img: Option<&std::path::Path>, rid: u64, part: &dyn Fn(&str)) -> Result<String, String> {
+        if !self.p.as_mut().is_some_and(Proc::alive) || self.turns >= RESET_AFTER || self.key != (c.codex_model.clone(), c.codex_effort.clone()) {
             self.start(c)?;
         }
         self.turns = if img.is_some() { RESET_AFTER } else { self.turns + 1 }; // an image stays in the thread: fresh one next time
@@ -578,29 +754,56 @@ impl Codex {
             self.close();
             return Err(e);
         }
-        let (mut acc, mut err) = (String::new(), String::new());
+        let (mut acc, mut err, mut turn) = (String::new(), String::new(), String::new());
+        let mut stop: Option<Instant> = None; // when the turn was interrupted
         loop {
-            let v = match self.read() {
-                Ok(v) => v,
-                Err(e) => {
+            let p = self.p.as_mut().unwrap();
+            let wait = match stop {
+                Some(t) => p.read(GRACE.saturating_sub(t.elapsed()), 0),
+                None => p.read(STALL, if turn.is_empty() { 0 } else { rid }), // a turn can be interrupted once its id is known
+            };
+            let v = match wait {
+                Wait::Line(v) => v,
+                Wait::Newer => {
+                    // a newer selection: end this turn but keep the process and its thread
+                    p.send(json!({"id": self.next_id, "method": "turn/interrupt", "params": {"threadId": self.thread, "turnId": turn}}));
+                    self.next_id += 1;
+                    stop = Some(Instant::now());
+                    continue;
+                }
+                Wait::Eof | Wait::Stalled if stop.is_some() => {
+                    self.close(); // the interrupt did not end the turn in time
+                    return Err(CANCELLED.into());
+                }
+                Wait::Stalled => {
                     self.close();
-                    return Err(e);
+                    return Err(Self::stalled());
+                }
+                Wait::Eof => {
+                    self.close();
+                    return Err(Self::exit_reason());
                 }
             };
-            if v["id"] == id && v.get("error").is_some() {
-                self.close();
-                return Err(v["error"]["message"].as_str().unwrap_or("Codex error").to_string());
+            if v["id"] == id && v.get("method").is_none() {
+                if v.get("error").is_some() {
+                    self.close();
+                    return Err(v["error"]["message"].as_str().unwrap_or("Codex error").to_string());
+                }
+                turn = v["result"]["turn"]["id"].as_str().unwrap_or("").to_string();
+                continue;
             }
             match v["method"].as_str() {
-                Some("item/agentMessage/delta") => {
+                Some("item/agentMessage/delta") if stop.is_none() => {
                     acc.push_str(v["params"]["delta"].as_str().unwrap_or(""));
                     part(&acc);
                 }
                 Some("error") => err = v["params"]["error"]["message"].as_str().or(v["params"]["message"].as_str()).unwrap_or("").to_string(),
-                Some("turn/completed") => {
-                    let turn = &v["params"]["turn"];
+                Some("turn/completed") if turn.is_empty() || v["params"]["turn"]["id"] == turn.as_str() => {
+                    if stop.is_some() {
+                        return Err(CANCELLED.into()); // interrupted cleanly: the thread is ready for the next turn
+                    }
                     if acc.trim().is_empty() {
-                        let e = turn["error"]["message"].as_str().map(str::to_string).filter(|s| !s.is_empty()).unwrap_or(err);
+                        let e = v["params"]["turn"]["error"]["message"].as_str().map(str::to_string).filter(|s| !s.is_empty()).unwrap_or(err);
                         self.close();
                         return Err(if e.is_empty() { "Codex không trả lời".into() } else { e });
                     }
@@ -753,13 +956,13 @@ const WM_KSEL: u32 = WM_APP + 8; // keyboard selection finished
 
 static POPUP: AtomicIsize = AtomicIsize::new(0);
 static TRAY_ICON: AtomicIsize = AtomicIsize::new(0);
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0); // message Explorer broadcasts when its taskbar (re)starts
 
 /// The icon embedded by build.ps1 (resource 1), at `px` pixels.
 unsafe fn app_icon(px: i32) -> isize {
     LoadImageW(GetModuleHandleW(null()), 1usize as *const u16, IMAGE_ICON, px, px, LR_DEFAULTCOLOR) as isize
 }
 
-// ponytail: an Explorer restart drops the tray icon (TaskbarCreated not handled); restart the app then
 fn tray(op: u32) {
     unsafe {
         let mut d: NOTIFYICONDATAW = std::mem::zeroed();
@@ -1261,7 +1464,7 @@ struct Done {
     out: String,
     head: String,
 }
-type Key = (String, String, usize, String); // backend, model, target, text
+type Key = (String, String, String, usize, String); // backend, model, effort, target, text
 
 fn label(c: &Config, target: usize) -> String {
     let be = if c.backend == "codex" { "Codex" } else { "Claude" };
@@ -1297,24 +1500,28 @@ fn worker(rx: mpsc::Receiver<Job>, first: Config) {
         let msg = user_msg(TARGETS[job.target].1, if job.image.is_some() { IMG_TEXT } else { &job.text });
         let rid = job.rid;
         let img = job.image.as_deref();
-        let r = if job.cfg.backend == "codex" {
+        let codex_on = job.cfg.backend == "codex";
+        let r = if codex_on {
             claude.close(); // only the backend in use keeps a process
-            codex.translate(&job.cfg, &msg, img, &|s| post(WM_PART, rid, s.to_string()))
+            codex.translate(&job.cfg, &msg, img, rid, &|s| post(WM_PART, rid, s.to_string()))
         } else {
             codex.close();
-            claude.translate(&job.cfg, &msg, img, &|s| post(WM_PART, rid, s.to_string()))
+            claude.translate(&job.cfg, &msg, img, rid, &|s| post(WM_PART, rid, s.to_string()))
         };
         match r {
             Ok(out) => {
                 let head = format!("{} · {:.1}s", label(&job.cfg, job.target), t.elapsed().as_secs_f32());
-                let key = (job.cfg.backend.clone(), job.cfg.model().to_string(), job.target, job.text);
+                let key = (job.cfg.backend.clone(), job.cfg.model().to_string(), job.cfg.effort().to_string(), job.target, job.text);
                 post(WM_DONE, rid, Done { key, out, head });
             }
+            Err(e) if e == CANCELLED => {} // dropped for a newer selection, which is next in the queue
             Err(e) => {
                 log(&format!("translate failed ({} {}): {e}", job.cfg.backend, job.cfg.model()));
                 post(WM_ERR, rid, e)
             }
         }
+        // the result is on screen: start the next process now if one is due, not when the next selection waits for it
+        if codex_on { codex.rewarm(&job.cfg) } else { claude.rewarm(&job.cfg) }
     }
 }
 
@@ -1658,7 +1865,7 @@ fn run() {
         s.rid += 1;
         s.result.clear();
         s.error = false;
-        let key = (s.cfg.backend.clone(), s.cfg.model().to_string(), s.target, s.text.clone());
+        let key = (s.cfg.backend.clone(), s.cfg.model().to_string(), s.cfg.effort().to_string(), s.target, s.text.clone());
         if let Some(r) = s.cache.get(&key).cloned() {
             s.head = format!("{} · đã lưu", label(&s.cfg, s.target));
             s.body = r.clone();
@@ -1668,6 +1875,7 @@ fn run() {
             s.head = format!("{} · đang dịch…", label(&s.cfg, s.target));
             s.body = "…".into();
             s.busy = true;
+            NEWEST.store(s.rid, Ordering::Relaxed); // a translation still running gives way to this one
             let _ = s.tx.send(Job { rid: s.rid, cfg: s.cfg.clone(), target: s.target, text: s.text.clone(), image: s.image.clone() });
         }
     });
@@ -1756,6 +1964,7 @@ fn model_menu() {
     unsafe {
         let hwnd = popup();
         let cfg = st(|s| s.cfg.clone());
+        refresh_models(); // the app may run for days: the first menu of a day also looks for new Claude IDs
         let codex = CODEX_LIST.lock().map(|l| l.clone()).unwrap_or_default();
         if matches!(&codex, Some(l) if l.is_empty()) {
             load_codex_list(cfg.clone()); // last load failed (not installed / not logged in yet): try again
@@ -2325,6 +2534,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             tray(NIM_DELETE);
             PostQuitMessage(0)
         }
+        m if m == TASKBAR_CREATED.load(Ordering::Relaxed) => tray(NIM_ADD), // Explorer restarted: its tray lost our icon
         _ => return DefWindowProcW(hwnd, msg, wp, lp),
     }
     0
@@ -2362,7 +2572,7 @@ fn selftest(cfg: &Config, which: &str) -> i32 {
     for (target, text) in cases {
         let t = Instant::now();
         let msg = user_msg(TARGETS[target].1, text);
-        let r = if which == "codex" { codex.translate(&c, &msg, None, &|_| {}) } else { claude.translate(&c, &msg, None, &|_| {}) };
+        let r = if which == "codex" { codex.translate(&c, &msg, None, 0, &|_| {}) } else { claude.translate(&c, &msg, None, 0, &|_| {}) };
         match r {
             Ok(o) => {
                 let bad = o.is_empty() || o == text || o.contains('哥');
@@ -2375,6 +2585,23 @@ fn selftest(cfg: &Config, which: &str) -> i32 {
             }
         }
     }
+    // a newer selection (rid 2) arrives at the first words of a long translation (rid 1): that one must stop
+    // at once and the same CLI process must translate the next text
+    let long = user_msg(TARGETS[0].1, &"The server crashed again after the update, please check the logs before the next release. ".repeat(20));
+    let short = user_msg(TARGETS[0].1, "Good morning, how are you?");
+    NEWEST.store(1, Ordering::Relaxed);
+    let newer = |_: &str| NEWEST.store(2, Ordering::Relaxed);
+    let t = Instant::now();
+    let (r1, kept, r2) = if which == "codex" {
+        let r1 = codex.translate(&c, &long, None, 1, &newer);
+        (r1, codex.p.as_mut().is_some_and(Proc::alive), codex.translate(&c, &short, None, 2, &|_| {}))
+    } else {
+        let r1 = claude.translate(&c, &long, None, 1, &newer);
+        (r1, claude.p.as_mut().is_some_and(Proc::alive), claude.translate(&c, &short, None, 2, &|_| {}))
+    };
+    let ok = r1.as_ref().is_err_and(|e| e == CANCELLED) && kept && r2.is_ok();
+    println!("{:.1}s interrupt: first={:?} process kept={kept} next={:?}{}", t.elapsed().as_secs_f32(), r1.map(|s| s.chars().count()), r2, if ok { "" } else { "   <- FAIL" });
+    fail += !ok as i32;
     claude.close();
     codex.close();
     println!("{}", if fail == 0 { "selftest OK" } else { "selftest FAIL" });
@@ -2388,7 +2615,7 @@ fn image_test(cfg: &Config, png: &str, which: &str) -> i32 {
     let t = Instant::now();
     let msg = user_msg(TARGETS[0].1, IMG_TEXT);
     let p = std::path::Path::new(png);
-    let r = if which == "codex" { Codex::new().translate(&c, &msg, Some(p), &|_| {}) } else { Claude::new().translate(&c, &msg, Some(p), &|_| {}) };
+    let r = if which == "codex" { Codex::new().translate(&c, &msg, Some(p), 0, &|_| {}) } else { Claude::new().translate(&c, &msg, Some(p), 0, &|_| {}) };
     match r {
         Ok(o) => {
             println!("{:.1}s {which}\n{o}", t.elapsed().as_secs_f32());
@@ -2404,6 +2631,7 @@ fn image_test(cfg: &Config, png: &str, which: &str) -> i32 {
 // ---------------------------------------------------------------- main
 fn main() {
     unsafe { AttachConsole(ATTACH_PARENT_PROCESS) }; // so --models / --selftest print in a terminal
+    std::panic::set_hook(Box::new(|info| log(&format!("panic: {info}")))); // no console: a crash would leave no trace
     let args: Vec<String> = std::env::args().collect();
     let cfg = load_cfg();
     if let Some(i) = args.iter().position(|a| a == "--image") {
@@ -2487,6 +2715,7 @@ fn main() {
             null_mut(), null_mut(), hinst, null::<c_void>(),
         );
         POPUP.store(hwnd as isize, Ordering::Relaxed);
+        TASKBAR_CREATED.store(RegisterWindowMessageW(w("TaskbarCreated").as_ptr()), Ordering::Relaxed);
         let ed = CreateWindowExW(
             0,
             w("EDIT").as_ptr(),
@@ -2503,6 +2732,7 @@ fn main() {
         let c1 = cfg.clone();
         thread::spawn(move || worker(rx, c1));
         load_codex_list(cfg.clone());
+        refresh_models();
         let brushes = [BG, BTN, BTN_ON, BORDER, SNIP_EDGE].map(|c| CreateSolidBrush(c) as isize);
         EDIT_BG.store(brushes[1], Ordering::Relaxed);
         STATE.with(|c| {
@@ -2516,8 +2746,16 @@ fn main() {
                 head_rc: std::mem::zeroed(), body_rc: std::mem::zeroed(), btns: Vec::new(),
             })
         });
-        SetWindowsHookExW(WH_MOUSE_LL, Some(hook), hinst, 0);
-        SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_hook), hinst, 0);
+        // The hooks get their own thread and message loop. On the UI thread, anything slow there (a screen grab,
+        // a busy clipboard) would stall the mouse and keyboard of the whole system, and Windows silently removes
+        // a hook that answers too slowly. The hook procedures only post messages to the popup.
+        thread::spawn(|| {
+            let hinst = GetModuleHandleW(null());
+            SetWindowsHookExW(WH_MOUSE_LL, Some(hook), hinst, 0);
+            SetWindowsHookExW(WH_KEYBOARD_LL, Some(kbd_hook), hinst, 0);
+            let mut msg: MSG = std::mem::zeroed();
+            while GetMessageW(&mut msg, null_mut(), 0, 0) > 0 {}
+        });
         let bad_keys = register_hotkeys(hwnd);
         TRAY_ICON.store(app_icon(GetSystemMetrics(SM_CXSMICON)), Ordering::Relaxed);
         tray(NIM_ADD);
