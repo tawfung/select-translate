@@ -1205,7 +1205,9 @@ fn pet_draw() {
 fn pet_home() -> (i32, i32) {
     if let (Some(x), Some(y)) = st(|s| (s.cfg.pet_x, s.cfg.pet_y)) {
         if unsafe { !MonitorFromPoint(POINT { x: x + 8, y: y + 8 }, MONITOR_DEFAULTTONULL).is_null() } {
-            return (x, y);
+            let (w, dpi) = monitor_of(x + 8, y + 8); // that screen may be smaller now: stay inside it
+            let sz = scale(PET_SIZE, dpi);
+            return (x.clamp(w.left, (w.right - sz).max(w.left)), y.clamp(w.top, (w.bottom - sz).max(w.top)));
         }
     }
     let (w, dpi) = monitor_of(0, 0);
@@ -1226,6 +1228,44 @@ fn pet_show(on: bool) {
             KillTimer(h, 1);
             ShowWindow(h, SW_HIDE);
             st(|s| s.armed = false);
+        }
+    }
+}
+
+static PET_TICK: AtomicU32 = AtomicU32::new(0);
+static PET_BAD: AtomicU32 = AtomicU32::new(0); // what pet_keep found last time: one log line per change
+
+/// The pet must stay shown, on a screen and above other windows. It is placed once at start-up, so a monitor
+/// unplugged, a new resolution, a wake-up from sleep or another always-on-top window could leave it out of sight
+/// until the app was restarted. Runs every ~2 s from the pet's timer, and with `rehome` right after a display change.
+fn pet_keep(rehome: bool) {
+    if !st(|s| s.cfg.pet && s.pet_drag.is_none()) || snip_active() {
+        return;
+    }
+    unsafe {
+        let h = pet();
+        let mut r: RECT = std::mem::zeroed();
+        GetWindowRect(h, &mut r);
+        let mid = POINT { x: (r.left + r.right) / 2, y: (r.top + r.bottom) / 2 };
+        let hidden = IsWindowVisible(h) == 0;
+        let off = MonitorFromPoint(mid, MONITOR_DEFAULTTONULL).is_null();
+        let top = GetAncestor(WindowFromPoint(mid), GA_ROOT);
+        let mut cls = [0u16; 16];
+        let n = GetClassNameW(top, cls.as_mut_ptr(), 16) as usize;
+        let menu = String::from_utf16_lossy(&cls[..n]) == "#32768"; // an open menu may cover the pet for a moment
+        let covered = !hidden && !off && top != h && top != popup() && !menu;
+        if rehome || off {
+            let (x, y) = pet_home();
+            SetWindowPos(h, HWND_TOPMOST, x, y, 0, 0, SWP_NOSIZE | SWP_NOACTIVATE);
+        } else if covered {
+            SetWindowPos(h, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        if hidden {
+            ShowWindow(h, SW_SHOWNOACTIVATE);
+        }
+        let bad = hidden as u32 | (off as u32) << 1 | (covered as u32) << 2;
+        if PET_BAD.swap(bad, Ordering::Relaxed) != bad && bad != 0 {
+            log(&format!("pet brought back: hidden={hidden} off-screen={off} covered={covered} at {},{}", r.left, r.top));
         }
     }
 }
@@ -1306,7 +1346,23 @@ fn in_pet(x: i32, y: i32) -> bool {
 unsafe extern "system" fn pet_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRESULT {
     match msg {
         WM_MOUSEACTIVATE => return MA_NOACTIVATE as LRESULT, // the chat app keeps focus and its selection
-        WM_TIMER => pet_draw(),
+        WM_TIMER if wp == 2 => {
+            KillTimer(hwnd, 2);
+            pet_keep(true);
+        }
+        WM_TIMER => {
+            pet_draw();
+            if PET_TICK.fetch_add(1, Ordering::Relaxed) % 32 == 31 {
+                pet_keep(false);
+            }
+        }
+        // screens added/removed/resized or the taskbar moved: put the pet back once the changes have settled
+        WM_DISPLAYCHANGE => {
+            SetTimer(hwnd, 2, 1500, None);
+        }
+        WM_SETTINGCHANGE if wp == SPI_SETWORKAREA as usize => {
+            SetTimer(hwnd, 2, 1500, None);
+        }
         WM_LBUTTONDOWN => {
             let mut pt = POINT { x: 0, y: 0 };
             GetCursorPos(&mut pt);
@@ -1562,6 +1618,8 @@ struct State {
     busy: bool,  // a translation is running (pet shows dots)
     t0: Instant, // pet animation clock
     pet_drag: Option<(i32, i32, i32, i32, bool)>, // grab offset x/y, start x/y, moved
+    drag: Option<(i32, i32, i32, i32, bool)>,     // the same for the popup: drag it off the text it covers
+    moved: Option<((i32, i32), (i32, i32))>,      // where the user dragged the popup: (anchor it belongs to, top-left)
     rid: u64,
     toast_rid: u64,
     text: String,
@@ -1721,9 +1779,18 @@ fn layout(show: bool) {
                 }
                 by + btn_h + pad
             };
-            let r = mi.rcWork;
-            let nx = (ax + sc(12)).min(r.right - width - 4).max(r.left);
-            let ny = if ay + sc(18) + height <= r.bottom { ay + sc(18) } else { (ay - height - sc(12)).max(r.top) };
+            let (nx, ny) = match s.moved {
+                // dragged by the user: it stays there (inside that screen) for as long as this popup lives
+                Some((a, (mx, my))) if a == s.anchor => {
+                    let r = monitor_of(mx + width / 2, my + 8).0;
+                    (mx.min(r.right - width).max(r.left), my.min(r.bottom - height).max(r.top))
+                }
+                _ => {
+                    let r = mi.rcWork;
+                    let ny = if ay + sc(18) + height <= r.bottom { ay + sc(18) } else { (ay - height - sc(12)).max(r.top) };
+                    ((ax + sc(12)).min(r.right - width - 4).max(r.left), ny)
+                }
+            };
             if show {
                 s.visible = true;
             }
@@ -1743,14 +1810,18 @@ fn layout(show: bool) {
 }
 
 fn hide() {
-    let (reply, src) = st(|s| {
+    let (reply, src, drag) = st(|s| {
         let r = s.reply;
         s.reply = false;
         s.visible = false;
-        (r, s.src)
+        s.moved = None; // the next popup opens next to its own text again
+        (r, s.src, s.drag.take().is_some())
     });
     unsafe {
         let h = popup();
+        if drag {
+            ReleaseCapture();
+        }
         let had_focus = GetForegroundWindow() == h;
         ShowWindow(h, SW_HIDE);
         if reply {
@@ -1820,6 +1891,11 @@ unsafe extern "system" fn edit_proc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         _ => {}
     }
     CallWindowProcW(std::mem::transmute::<isize, WNDPROC>(EDIT_PROC.load(Ordering::Relaxed)), hwnd, msg, wp, lp)
+}
+
+/// The popup button at a client point.
+fn btn_at(x: i32, y: i32) -> Option<u32> {
+    st(|s| s.btns.iter().find(|(r, _, _)| x >= r.left && x < r.right && y >= r.top && y < r.bottom).map(|b| b.1))
 }
 
 fn in_popup(x: i32, y: i32) -> bool {
@@ -2432,11 +2508,45 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             SetBkColor(wp as HDC, BTN);
             return EDIT_BG.load(Ordering::Relaxed);
         }
+        // press anywhere but a button and drag: the popup moves off the text it covers (a notice just times out)
+        WM_LBUTTONDOWN => {
+            let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
+            if st(|s| s.rid != s.toast_rid) && btn_at(x, y).is_none() {
+                let mut pt = POINT { x: 0, y: 0 };
+                GetCursorPos(&mut pt);
+                let mut r: RECT = std::mem::zeroed();
+                GetWindowRect(hwnd, &mut r);
+                SetCapture(hwnd);
+                st(|s| s.drag = Some((pt.x - r.left, pt.y - r.top, pt.x, pt.y, false)));
+            }
+        }
+        WM_MOUSEMOVE => {
+            let mut pt = POINT { x: 0, y: 0 };
+            GetCursorPos(&mut pt);
+            let to = st(|s| {
+                let d = s.drag.as_mut()?;
+                if !d.4 && ((pt.x - d.2).abs() > 4 || (pt.y - d.3).abs() > 4) {
+                    d.4 = true;
+                }
+                let to = d.4.then_some((pt.x - d.0, pt.y - d.1))?;
+                s.moved = Some((s.anchor, to)); // layout() keeps it there when the text changes (streaming, another language)
+                Some(to)
+            });
+            if let Some((x, y)) = to {
+                SetWindowPos(hwnd, null_mut(), x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            }
+        }
+        WM_CAPTURECHANGED => st(|s| s.drag = None),
         WM_LBUTTONUP => {
             let (x, y) = ((lp & 0xffff) as i16 as i32, ((lp >> 16) & 0xffff) as i16 as i32);
-            let hit = st(|s| s.btns.iter().find(|(r, _, _)| x >= r.left && x < r.right && y >= r.top && y < r.bottom).map(|b| b.1));
-            if let Some(id) = hit {
-                click(id);
+            let drag = st(|s| s.drag.take());
+            if drag.is_some() {
+                ReleaseCapture();
+            }
+            if !matches!(drag, Some((.., true))) {
+                if let Some(id) = btn_at(x, y) {
+                    click(id);
+                }
             }
             if st(|s| s.reply) {
                 SetFocus(edit()); // keep typing after a button
@@ -2738,7 +2848,7 @@ fn main() {
         STATE.with(|c| {
             *c.borrow_mut() = Some(State {
                 cfg, tx, visible: false, paused: false, menu_open: false, armed: false, busy: false,
-                t0: Instant::now(), pet_drag: None, rid: 0, toast_rid: 0,
+                t0: Instant::now(), pet_drag: None, drag: None, moved: None, rid: 0, toast_rid: 0,
                 text: String::new(), image: None, snips: 0, snip_end: None, reply: false, quote: String::new(),
                 quote_rc: std::mem::zeroed(), edit_rc: std::mem::zeroed(), out_rc: std::mem::zeroed(), wrap: Default::default(), target: 0, result: String::new(), head: String::new(), body: String::new(),
                 error: false, src: 0, anchor: (0, 0), cache: HashMap::new(), dpi: 0, fonts: [0; 4], icon: 0,

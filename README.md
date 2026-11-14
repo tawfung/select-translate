@@ -36,7 +36,7 @@ Dùng luôn tài khoản Claude/ChatGPT đã đăng nhập trên máy, không c�
 - **Chọn model tuỳ ý**: đổi giữa Claude và Codex, model và mức effort ngay trên popup; danh sách model lấy theo tài khoản của bạn.
 - **Pet nhỏ ở góc màn hình**: click (hoặc `Ctrl+Alt+D`) để bật dịch, lần nữa để tắt; kéo đi đâu cũng được.
 - **Bôi đen bằng chuột hay bàn phím đều nhận**: kéo, double/triple-click, Shift+click, Shift + phím mũi tên, Ctrl+A.
-- **Không làm phiền**: popup không lấy focus của ô chat, clipboard được trả lại như cũ.
+- **Không làm phiền**: popup không lấy focus của ô chat, clipboard được trả lại như cũ. Popup che mất chữ gốc thì nắm kéo nó sang chỗ khác.
 
 ## Cài đặt
 
