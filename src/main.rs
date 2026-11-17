@@ -181,6 +181,7 @@ const EFFORTS_CLAUDE: [&str; 3] = ["low", "medium", "high"];
 const EFFORTS_CODEX: [&str; 4] = ["minimal", "low", "medium", "high"];
 const TARGETS: [(&str, &str); 3] = [("VI", "Vietnamese"), ("EN", "English"), ("中文", "Simplified Chinese")];
 const MAX_CHARS: usize = 3000;
+const SUM_MAX_CHARS: usize = 20000; // a selection longer than MAX_CHARS is not translated but summed up
 const RESET_AFTER: u32 = 30; // restart the Claude process after N translations (history grows)
 const NOWIN: u32 = 0x0800_0000;
 const NEWCONSOLE: u32 = 0x0000_0010;
@@ -200,12 +201,18 @@ Keep the sentence type (statement, question, request) and the tone of the origin
 Keep names, code, numbers, URLs, @mentions and emoji unchanged. Use a polite, natural tone.
 Vietnamese address words (anh, chị, em, bạn, ơi) are politeness markers: never render them as family terms (哥, 姐, 弟, 妹, brother, sister); drop them or use a neutral form.
 If an image is attached, the TEXT is the text shown in the image (a screenshot of a chat, game UI, document...): read all of it in reading order and write it in the TARGET language with the same rules, one line per text block; if the image has no readable text, describe it in one short sentence in the TARGET language.
+If the message starts with the line \"TASK: SUMMARY\", do not translate. The TEXT is then usually a long chat (several people, many messages). Write a summary in the TARGET language for a reader who has ten seconds: the outcome first (what was decided, or what is still open), then what is being asked and of whom, with only the cause, time, number or name needed to understand that. At most 2 short sentences, about 40 words; only when a very long chat covers separate topics, one short line per topic, at most 4. Plain everyday words. Leave out greetings, repetition, back-and-forth, symptoms, how the cause was found, attempts that led nowhere and anything else the reader can do without; no opener such as \"the chat is about\".
 Output only the resulting text: no quotes, no labels, no notes.";
 
 const IMG_TEXT: &str = "(the text in the attached image)";
 
 fn user_msg(target: &str, text: &str) -> String {
     format!("TARGET: {target}\nTEXT:\n<<<\n{text}\n>>>")
+}
+
+/// A short summary of the text instead of a translation (the "Tóm tắt" button, or a selection too long to translate).
+fn sum_msg(target: &str, text: &str) -> String {
+    format!("TASK: SUMMARY\n{}", user_msg(target, text))
 }
 
 fn b64(d: &[u8]) -> String {
@@ -1019,7 +1026,7 @@ fn register_hotkeys(hwnd: HWND) -> Vec<String> {
 fn tray_menu() {
     unsafe {
         let hwnd = popup();
-        let (paused, head) = st(|s| (s.paused, label(&s.cfg, 0)));
+        let (paused, head) = st(|s| (s.paused, label(&s.cfg, 0, false)));
         let m = CreatePopupMenu();
         let add = |f: u32, id: usize, t: &str| {
             let t = w(t);
@@ -1512,6 +1519,7 @@ struct Job {
     rid: u64,
     cfg: Config,
     target: usize,
+    sum: bool, // a short summary instead of a translation
     text: String,
     image: Option<PathBuf>, // a screen snip (PNG): translate the text in it
 }
@@ -1520,11 +1528,11 @@ struct Done {
     out: String,
     head: String,
 }
-type Key = (String, String, String, usize, String); // backend, model, effort, target, text
+type Key = (String, String, String, usize, bool, String); // backend, model, effort, target, summary, text
 
-fn label(c: &Config, target: usize) -> String {
+fn label(c: &Config, target: usize, sum: bool) -> String {
     let be = if c.backend == "codex" { "Codex" } else { "Claude" };
-    format!("{be} · {} · {} · → {}", c.model(), c.effort(), TARGETS[target].0)
+    format!("{be} · {} · {} · {}→ {}", c.model(), c.effort(), if sum { "tóm tắt " } else { "" }, TARGETS[target].0)
 }
 
 fn worker(rx: mpsc::Receiver<Job>, first: Config) {
@@ -1553,7 +1561,8 @@ fn worker(rx: mpsc::Receiver<Job>, first: Config) {
             job = j; // only the newest selection matters
         }
         let t = Instant::now();
-        let msg = user_msg(TARGETS[job.target].1, if job.image.is_some() { IMG_TEXT } else { &job.text });
+        let text = if job.image.is_some() { IMG_TEXT } else { &job.text };
+        let msg = if job.sum { sum_msg(TARGETS[job.target].1, text) } else { user_msg(TARGETS[job.target].1, text) };
         let rid = job.rid;
         let img = job.image.as_deref();
         let codex_on = job.cfg.backend == "codex";
@@ -1566,8 +1575,8 @@ fn worker(rx: mpsc::Receiver<Job>, first: Config) {
         };
         match r {
             Ok(out) => {
-                let head = format!("{} · {:.1}s", label(&job.cfg, job.target), t.elapsed().as_secs_f32());
-                let key = (job.cfg.backend.clone(), job.cfg.model().to_string(), job.cfg.effort().to_string(), job.target, job.text);
+                let head = format!("{} · {:.1}s", label(&job.cfg, job.target, job.sum), t.elapsed().as_secs_f32());
+                let key = (job.cfg.backend.clone(), job.cfg.model().to_string(), job.cfg.effort().to_string(), job.target, job.sum, job.text);
                 post(WM_DONE, rid, Done { key, out, head });
             }
             Err(e) if e == CANCELLED => {} // dropped for a newer selection, which is next in the queue
@@ -1597,6 +1606,7 @@ const B_LOGIN: u32 = 4;
 const B_CLOSE: u32 = 5;
 const B_REPLY: u32 = 6;
 const B_SEND: u32 = 7;
+const B_SUM: u32 = 8;
 
 const EM_SETSEL: u32 = 0x00b1; // edit control messages (windows-sys has them behind the big Controls feature)
 const EM_LIMITTEXT: u32 = 0x00c5;
@@ -1633,6 +1643,7 @@ struct State {
     out_rc: RECT,  // reply mode: right column, the AI's version (read-only, copy icon in its corner)
     wrap: (String, String), // whitespace before/after the selection
     target: usize,
+    sum: bool, // the popup shows a short summary of the text, not its translation
     result: String,
     head: String,
     body: String,
@@ -1720,6 +1731,7 @@ fn layout(show: bool) {
                 if s.image.is_none() {
                     specs.push((B_PASTE, "Dán thay".into())); // a snip has no selection to replace
                 }
+                specs.push((B_SUM, "Tóm tắt".into()));
                 specs.push((B_MODEL, "Model ▾".into()));
                 if s.error {
                     specs.push((B_LOGIN, "Đăng nhập".into()));
@@ -1843,6 +1855,7 @@ fn reply_start() {
         s.target = if s.text.chars().any(|c| ('\u{4e00}'..='\u{9fff}').contains(&c)) { 2 } else { 1 };
         s.text.clear();
         s.image = None;
+        s.sum = false;
         s.result.clear();
         s.error = false;
         s.busy = false;
@@ -1941,18 +1954,18 @@ fn run() {
         s.rid += 1;
         s.result.clear();
         s.error = false;
-        let key = (s.cfg.backend.clone(), s.cfg.model().to_string(), s.cfg.effort().to_string(), s.target, s.text.clone());
+        let key = (s.cfg.backend.clone(), s.cfg.model().to_string(), s.cfg.effort().to_string(), s.target, s.sum, s.text.clone());
         if let Some(r) = s.cache.get(&key).cloned() {
-            s.head = format!("{} · đã lưu", label(&s.cfg, s.target));
+            s.head = format!("{} · đã lưu", label(&s.cfg, s.target, s.sum));
             s.body = r.clone();
             s.result = r;
             s.busy = false;
         } else {
-            s.head = format!("{} · đang dịch…", label(&s.cfg, s.target));
+            s.head = format!("{} · {}", label(&s.cfg, s.target, s.sum), if s.sum { "đang tóm tắt…" } else { "đang dịch…" });
             s.body = "…".into();
             s.busy = true;
             NEWEST.store(s.rid, Ordering::Relaxed); // a translation still running gives way to this one
-            let _ = s.tx.send(Job { rid: s.rid, cfg: s.cfg.clone(), target: s.target, text: s.text.clone(), image: s.image.clone() });
+            let _ = s.tx.send(Job { rid: s.rid, cfg: s.cfg.clone(), target: s.target, sum: s.sum, text: s.text.clone(), image: s.image.clone() });
         }
     });
     layout(true);
@@ -2016,7 +2029,8 @@ fn on_text(src: isize, x: i32, y: i32, raw: String) {
     // whitespace around the selection (e.g. a trailing line break) is put back on "Dán thay"
     let lead = raw[..raw.len() - raw.trim_start().len()].to_string();
     let tail = raw[raw.trim_end().len()..].to_string();
-    if text.is_empty() || !text.chars().any(char::is_alphanumeric) || text.chars().count() > MAX_CHARS {
+    let n = text.chars().count();
+    if text.is_empty() || !text.chars().any(char::is_alphanumeric) || n > SUM_MAX_CHARS {
         return;
     }
     let skip = st(|s| {
@@ -2029,6 +2043,7 @@ fn on_text(src: isize, x: i32, y: i32, raw: String) {
         s.image = None;
         s.wrap = (lead, tail);
         s.target = 0; // default: Vietnamese
+        s.sum = n > MAX_CHARS; // too long to translate (a whole chat): sum it up
         false
     });
     if !skip {
@@ -2146,6 +2161,15 @@ fn click(id: u32) {
         }
         B_CLOSE => hide(),
         B_REPLY => reply_start(),
+        B_SUM => {
+            // on/off; a text too long to translate stays a summary
+            if st(|s| {
+                s.sum = !s.sum || s.text.chars().count() > MAX_CHARS;
+                !s.text.is_empty()
+            }) {
+                run();
+            }
+        }
         B_SEND => reply_send(),
         t if (B_VI..B_VI + TARGETS.len() as u32).contains(&t) => {
             let (go, reply) = st(|s| {
@@ -2394,6 +2418,7 @@ unsafe fn snip_done(hwnd: HWND, r: RECT) {
                 s.anchor = anchor;
                 s.wrap = Default::default();
                 s.target = 0;
+                s.sum = false;
             });
             run();
         }
@@ -2485,7 +2510,7 @@ unsafe fn paint(hwnd: HWND) {
         }
         draw(s.fonts[1], FG, &s.body, s.body_rc, DT_WORDBREAK | DT_NOPREFIX | DT_EDITCONTROL);
         for (r, id, l) in &s.btns {
-            let on = *id == B_VI + s.target as u32;
+            let on = *id == B_VI + s.target as u32 || (*id == B_SUM && s.sum);
             let icon = s.reply && *id == B_COPY; // the copy icon in the AI version box
             // teal, like the armed pet: the main actions stand out (Trả lời; in reply mode Viết and copy)
             let accent = *id == B_REPLY || icon || (s.reply && *id == B_SEND);
@@ -2574,7 +2599,7 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         WM_PART => {
             let b = Box::from_raw(lp as *mut String);
             if st(|s| s.rid) == wp as u64 {
-                let head = st(|s| format!("{} · đang dịch…", label(&s.cfg, s.target)));
+                let head = st(|s| format!("{} · {}", label(&s.cfg, s.target, s.sum), if s.sum { "đang tóm tắt…" } else { "đang dịch…" }));
                 show_msg(&head, &b, false);
             }
         }
@@ -2695,6 +2720,14 @@ fn selftest(cfg: &Config, which: &str) -> i32 {
             }
         }
     }
+    // summary: a chat of several messages comes back shorter, with the decision (roll back) and the request (tell the community team) still in it
+    let chat = "Lan: Hi Minh, are you there?\nMinh: Yes, just back from lunch, what's up?\nLan: The login server went down again at 9am, players in SEA cannot get in.\nMinh: Again? Let me look.\nMinh: I restarted it but it crashed after ten minutes, memory keeps growing.\nLan: Hmm, strange. Did anything change?\nLan: QA says it started after yesterday's patch, the new friend list feature.\nMinh: That makes sense, that feature caches a lot.\nMinh: OK, I will roll back that patch now and we fix the leak tomorrow.\nLan: Fine, please tell the community team so they can post a notice.\nMinh: Will do. Thanks!\nLan: Thanks, talk later.";
+    let t = Instant::now();
+    let msg = sum_msg(TARGETS[0].1, chat);
+    let r = if which == "codex" { codex.translate(&c, &msg, None, 0, &|_| {}) } else { claude.translate(&c, &msg, None, 0, &|_| {}) };
+    let ok = r.as_ref().is_ok_and(|o| !o.is_empty() && o.lines().count() <= 4 && o.chars().count() < chat.chars().count() * 2 / 5);
+    println!("{:.1}s summary: {r:?}{}", t.elapsed().as_secs_f32(), if ok { "" } else { "   <- FAIL" });
+    fail += !ok as i32;
     // a newer selection (rid 2) arrives at the first words of a long translation (rid 1): that one must stop
     // at once and the same CLI process must translate the next text
     let long = user_msg(TARGETS[0].1, &"The server crashed again after the update, please check the logs before the next release. ".repeat(20));
@@ -2850,7 +2883,7 @@ fn main() {
                 cfg, tx, visible: false, paused: false, menu_open: false, armed: false, busy: false,
                 t0: Instant::now(), pet_drag: None, drag: None, moved: None, rid: 0, toast_rid: 0,
                 text: String::new(), image: None, snips: 0, snip_end: None, reply: false, quote: String::new(),
-                quote_rc: std::mem::zeroed(), edit_rc: std::mem::zeroed(), out_rc: std::mem::zeroed(), wrap: Default::default(), target: 0, result: String::new(), head: String::new(), body: String::new(),
+                quote_rc: std::mem::zeroed(), edit_rc: std::mem::zeroed(), out_rc: std::mem::zeroed(), wrap: Default::default(), target: 0, sum: false, result: String::new(), head: String::new(), body: String::new(),
                 error: false, src: 0, anchor: (0, 0), cache: HashMap::new(), dpi: 0, fonts: [0; 4], icon: 0,
                 icon_at: (0, 0, 0), brushes,
                 head_rc: std::mem::zeroed(), body_rc: std::mem::zeroed(), btns: Vec::new(),

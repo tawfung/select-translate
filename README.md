@@ -32,6 +32,7 @@ Dùng luôn tài khoản Claude/ChatGPT đã đăng nhập trên máy, không c�
 - **Dịch ảnh như Snipping Tool**: chuột phải vào pet (hoặc `Ctrl+Alt+S`) rồi kéo khung quanh chỗ cần dịch: ảnh chụp màn hình, game, video, file PDF scan… AI đọc chữ trong khung và dịch luôn.
 - **Viết lại EN / 中文**: bấm EN hoặc 中文 để viết lại cho đúng ngữ cảnh. Nếu chữ đã là ngôn ngữ đó, tool chỉ sửa chính tả và câu chữ.
 - **Trả lời nhanh**: bấm **↩ Trả lời** dưới bản dịch, gõ câu trả lời bằng tiếng Việt hoặc English rồi Enter, AI viết lại sang EN hoặc 中文 (tự chọn theo ngôn ngữ tin nhắn gốc) ở khung bên cạnh, bấm icon copy là dán được vào chat. Popup trả lời chỉ đóng khi bấm ✕, click ra ngoài không mất bản nháp.
+- **Tóm tắt**: bấm **Tóm tắt** để rút cả đoạn chat dài thành vài câu gọn mà đủ ý: chuyện gì xảy ra, đã chốt gì, ai cần làm gì (bấm VI / EN / 中文 để đổi ngôn ngữ, bấm lần nữa để về bản dịch). Bôi đen đoạn quá dài để dịch (trên 3.000 ký tự, tối đa 20.000) thì tool tóm tắt luôn.
 - **Dán thay**: thay đoạn đang bôi đen bằng bản dịch, rất tiện khi soạn tin nhắn.
 - **Chọn model tuỳ ý**: đổi giữa Claude và Codex, model và mức effort ngay trên popup; danh sách model lấy theo tài khoản của bạn.
 - **Pet nhỏ ở góc màn hình**: click (hoặc `Ctrl+Alt+D`) để bật dịch, lần nữa để tắt; kéo đi đâu cũng được.
