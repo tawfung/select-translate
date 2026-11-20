@@ -48,7 +48,7 @@ struct Config {
     claude_path: String,   // optional override, e.g. C:\...\claude.exe
     codex_path: String,    // optional override, e.g. C:\...\codex.exe
     pet: bool,             // true: click the pet, then select = translate (any app); false: every selection in `apps`
-    pet_once: bool,        // false: a click on the pet translates every selection until clicked again; true: one selection, then off
+    pet_once: bool,        // false: a click on the pet translates every selection until clicked again; true: select first, each click translates that selection
     pet_x: Option<i32>,    // pet position (screen pixels); null = bottom-right corner
     pet_y: Option<i32>,
     hotkeys: Hotkeys,
@@ -1042,7 +1042,7 @@ fn tray_menu() {
         let (pet_on, armed, once) = st(|s| (s.cfg.pet, s.armed, s.cfg.pet_once));
         add(MF_STRING | if armed { MF_CHECKED } else { 0 }, 8, &format!("Dịch bôi đen ở mọi app (= click pet)\t{}", k.arm));
         add(MF_STRING | if pet_on { MF_CHECKED } else { 0 }, 4, &format!("Pet: click pet rồi bôi đen mới dịch\t{}", k.pet));
-        add(MF_STRING | if once { MF_CHECKED } else { 0 }, 10, "Mỗi lần click pet chỉ dịch 1 lần bôi đen rồi tự tắt");
+        add(MF_STRING | if once { MF_CHECKED } else { 0 }, 10, "Bôi đen trước, click pet mới dịch (mỗi click 1 lần)");
         add(MF_STRING | if paused { MF_CHECKED } else { 0 }, 1, &format!("Tạm dừng\t{}", k.pause));
         add(MF_STRING, 2, "Model / effort…");
         add(MF_STRING, 3, "Mở config.json (đổi phím tắt: mục hotkeys)");
@@ -1064,10 +1064,13 @@ fn tray_menu() {
             10 => {
                 let once = st(|s| {
                     s.cfg.pet_once = !s.cfg.pet_once;
+                    s.armed = false;
                     save_cfg(&s.cfg);
                     s.cfg.pet_once
                 });
-                toast(if once { "Click pet: dịch 1 lần bôi đen rồi tự tắt" } else { "Click pet: dịch mọi lần bôi đen đến khi click lại" });
+                tray(NIM_MODIFY);
+                pet_draw();
+                toast(if once { "Bôi đen trước, rồi click pet để dịch (mỗi click 1 lần)" } else { "Click pet: dịch mọi lần bôi đen đến khi click lại" });
             }
             2 => model_menu(),
             3 => {
@@ -1319,22 +1322,49 @@ fn pet_snap() {
 }
 
 fn pet_click() {
-    st(|s| {
-        // armed stays on (every selection translates) until the pet is clicked again, or in `pet_once` mode until
-        // one selection was translated (on_text); clicking a sleeping pet wakes it armed
-        s.armed = s.paused || !s.armed;
+    let once = st(|s| {
+        // default: armed stays on (every selection translates) until the pet is clicked again; clicking a sleeping pet wakes it armed.
+        // `pet_once`: never armed, each click translates what is selected right now
+        s.armed = !s.cfg.pet_once && (s.paused || !s.armed);
         s.paused = false;
+        s.cfg.pet_once
     });
     tray(NIM_MODIFY);
     pet_draw();
+    if once {
+        translate_selection();
+    }
+}
+
+/// `pet_once` mode: select first, then click the pet (or press the arm hotkey) to translate that selection, once.
+fn translate_selection() {
+    if st(|s| s.reply) || snip_active() {
+        return;
+    }
+    let fg = unsafe { GetForegroundWindow() };
+    if proc_of(fg).1 == unsafe { GetCurrentProcessId() } {
+        return;
+    }
+    // the popup opens where the selection was made; a selection we did not see (other window): at the mouse
+    let (x, y) = match st(|s| s.last_sel) {
+        (w, x, y) if w == fg as isize => (x, y),
+        _ => {
+            let mut pt = POINT { x: 0, y: 0 };
+            unsafe { GetCursorPos(&mut pt) };
+            (pt.x, pt.y)
+        }
+    };
+    grab(fg as isize, x, y, true);
 }
 
 /// Hotkey "arm" (default Ctrl+Alt+D): same as a click on the pet, with a notice (the pet may be off or out of sight).
 fn hotkey_arm() {
     pet_click();
     let (armed, pet_on, once, k) = st(|s| (s.armed, s.cfg.pet, s.cfg.pet_once, s.cfg.hotkeys.arm.clone()));
+    if once {
+        return; // the selection is being translated: the popup is the notice
+    }
     toast(&match (armed, pet_on) {
-        (true, _) if once => format!("Đã BẬT dịch 1 lần bôi đen ở mọi app{}", key_hint(&k, " để tắt")),
         (true, _) => format!("Đã BẬT dịch bôi đen ở mọi app{}", key_hint(&k, " để tắt")),
         (false, true) => format!("Đã TẮT dịch bôi đen{}", key_hint(&k, " để bật")),
         (false, false) => format!("Chỉ dịch bôi đen trong app đã chọn (config.json){}", key_hint(&k, " để dịch mọi app")),
@@ -1641,6 +1671,7 @@ struct State {
     busy: bool,  // a translation is running (pet shows dots)
     t0: Instant, // pet animation clock
     pet_drag: Option<(i32, i32, i32, i32, bool)>, // grab offset x/y, start x/y, moved
+    last_sel: (isize, i32, i32), // window and point of the last selection seen (`pet_once`: where the popup opens)
     drag: Option<(i32, i32, i32, i32, bool)>,     // the same for the popup: drag it off the text it covers
     moved: Option<((i32, i32), (i32, i32))>,      // where the user dragged the popup: (anchor it belongs to, top-left)
     rid: u64,
@@ -1987,19 +2018,28 @@ fn run() {
 // ---------------------------------------------------------------- actions
 /// Pet off: every selection in `apps` is translated. Pet on: only after the pet was clicked (any app).
 fn on_select(x: i32, y: i32) {
-    let (paused, pet_on, armed, snip, reply) =
-        st(|s| (s.paused, s.cfg.pet, s.armed, s.snip_end.is_some_and(|t| t.elapsed().as_millis() < 500), s.reply));
-    if paused || reply || (pet_on && !armed) || snip || snip_active() || in_popup(x, y) || in_pet(x, y) {
+    if in_popup(x, y) || in_pet(x, y) {
         return;
     }
     let fg = unsafe { GetForegroundWindow() };
+    let (paused, pet_on, armed, snip, reply) = st(|s| {
+        s.last_sel = (fg as isize, x, y);
+        (s.paused, s.cfg.pet, s.armed, s.snip_end.is_some_and(|t| t.elapsed().as_millis() < 500), s.reply)
+    });
+    if paused || reply || (pet_on && !armed) || snip || snip_active() {
+        return;
+    }
     let (name, pid) = proc_of(fg);
     let apps = st(|s| s.cfg.apps.clone());
     let app_ok = armed || apps.is_empty() || apps.iter().any(|a| a.eq_ignore_ascii_case(&name));
     if pid == unsafe { GetCurrentProcessId() } || !app_ok {
         return;
     }
-    let fg = fg as isize;
+    grab(fg as isize, x, y, false);
+}
+
+/// Copy the selection of window `fg` and send it to on_text. `must`: the user asked for it, so say when nothing is selected.
+fn grab(fg: isize, x: i32, y: i32, must: bool) {
     thread::spawn(move || {
         // copy the selection with Ctrl+C, then give the user's clipboard back
         thread::sleep(Duration::from_millis(60));
@@ -2026,7 +2066,10 @@ fn on_select(x: i32, y: i32) {
             }
         }
         if !changed {
-            return; // nothing was selected
+            if must {
+                post(WM_TEXT, 1, (fg, x, y, String::new())); // nothing was selected
+            }
+            return;
         }
         thread::sleep(Duration::from_millis(30));
         let text = clip_get().unwrap_or_default();
@@ -2057,14 +2100,9 @@ fn on_text(src: isize, x: i32, y: i32, raw: String) {
         s.wrap = (lead, tail);
         s.target = 0; // default: Vietnamese
         s.sum = n > MAX_CHARS; // too long to translate (a whole chat): sum it up
-        if s.cfg.pet_once {
-            s.armed = false; // one selection per click on the pet
-        }
         false
     });
     if !skip {
-        tray(NIM_MODIFY);
-        pet_draw();
         run();
     }
 }
@@ -2612,7 +2650,11 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         }
         WM_TEXT => {
             let b = Box::from_raw(lp as *mut (isize, i32, i32, String));
-            on_text(b.0, b.1, b.2, b.3);
+            if wp == 1 {
+                toast("Chưa bôi đen gì · bôi đen trước rồi click pet");
+            } else {
+                on_text(b.0, b.1, b.2, b.3);
+            }
         }
         WM_PART => {
             let b = Box::from_raw(lp as *mut String);
@@ -2899,7 +2941,7 @@ fn main() {
         STATE.with(|c| {
             *c.borrow_mut() = Some(State {
                 cfg, tx, visible: false, paused: false, menu_open: false, armed: false, busy: false,
-                t0: Instant::now(), pet_drag: None, drag: None, moved: None, rid: 0, toast_rid: 0,
+                t0: Instant::now(), pet_drag: None, last_sel: (0, 0, 0), drag: None, moved: None, rid: 0, toast_rid: 0,
                 text: String::new(), image: None, snips: 0, snip_end: None, reply: false, quote: String::new(),
                 quote_rc: std::mem::zeroed(), edit_rc: std::mem::zeroed(), out_rc: std::mem::zeroed(), wrap: Default::default(), target: 0, sum: false, result: String::new(), head: String::new(), body: String::new(),
                 error: false, src: 0, anchor: (0, 0), cache: HashMap::new(), dpi: 0, fonts: [0; 4], icon: 0,
