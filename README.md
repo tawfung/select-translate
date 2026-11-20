@@ -62,7 +62,7 @@ Gỡ cài đặt: *Settings → Apps → Select Translate → Uninstall*.
 |---|---|
 | Tắt | Dịch ngay trong iMe (đổi danh sách app trong `config.json`) |
 | Bật, màu xám | Không dịch |
-| Bật, màu xanh ngọc (đã click) | Dịch ở mọi app, cho đến khi click pet lần nữa |
+| Bật, màu xanh ngọc (đã click) | Dịch ở mọi app, cho đến khi click pet lần nữa (mặc định). Tích "Mỗi lần click pet chỉ dịch 1 lần bôi đen rồi tự tắt" ở menu khay (`"pet_once": true`) thì dịch xong 1 lần là tự tắt |
 
 | Phím tắt | Tác dụng |
 |---|---|

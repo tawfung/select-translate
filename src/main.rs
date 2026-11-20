@@ -48,6 +48,7 @@ struct Config {
     claude_path: String,   // optional override, e.g. C:\...\claude.exe
     codex_path: String,    // optional override, e.g. C:\...\codex.exe
     pet: bool,             // true: click the pet, then select = translate (any app); false: every selection in `apps`
+    pet_once: bool,        // false: a click on the pet translates every selection until clicked again; true: one selection, then off
     pet_x: Option<i32>,    // pet position (screen pixels); null = bottom-right corner
     pet_y: Option<i32>,
     hotkeys: Hotkeys,
@@ -126,6 +127,7 @@ impl Default for Config {
             claude_path: String::new(),
             codex_path: String::new(),
             pet: true,
+            pet_once: false,
             pet_x: None,
             pet_y: None,
             hotkeys: Hotkeys::default(),
@@ -1037,9 +1039,10 @@ fn tray_menu() {
         let k = keys();
         add(MF_STRING, 7, &format!("Dịch ảnh: chọn vùng màn hình…\t{}", k.snip));
         add(MF_SEPARATOR, 0, "");
-        let (pet_on, armed) = st(|s| (s.cfg.pet, s.armed));
+        let (pet_on, armed, once) = st(|s| (s.cfg.pet, s.armed, s.cfg.pet_once));
         add(MF_STRING | if armed { MF_CHECKED } else { 0 }, 8, &format!("Dịch bôi đen ở mọi app (= click pet)\t{}", k.arm));
         add(MF_STRING | if pet_on { MF_CHECKED } else { 0 }, 4, &format!("Pet: click pet rồi bôi đen mới dịch\t{}", k.pet));
+        add(MF_STRING | if once { MF_CHECKED } else { 0 }, 10, "Mỗi lần click pet chỉ dịch 1 lần bôi đen rồi tự tắt");
         add(MF_STRING | if paused { MF_CHECKED } else { 0 }, 1, &format!("Tạm dừng\t{}", k.pause));
         add(MF_STRING, 2, "Model / effort…");
         add(MF_STRING, 3, "Mở config.json (đổi phím tắt: mục hotkeys)");
@@ -1058,6 +1061,14 @@ fn tray_menu() {
             4 => toggle_pet(),
             7 => snip_start(),
             8 => hotkey_arm(),
+            10 => {
+                let once = st(|s| {
+                    s.cfg.pet_once = !s.cfg.pet_once;
+                    save_cfg(&s.cfg);
+                    s.cfg.pet_once
+                });
+                toast(if once { "Click pet: dịch 1 lần bôi đen rồi tự tắt" } else { "Click pet: dịch mọi lần bôi đen đến khi click lại" });
+            }
             2 => model_menu(),
             3 => {
                 let _ = Command::new("notepad.exe").arg(cfg_path()).spawn();
@@ -1309,7 +1320,8 @@ fn pet_snap() {
 
 fn pet_click() {
     st(|s| {
-        // armed stays on (every selection translates) until the pet is clicked again; clicking a sleeping pet wakes it armed
+        // armed stays on (every selection translates) until the pet is clicked again, or in `pet_once` mode until
+        // one selection was translated (on_text); clicking a sleeping pet wakes it armed
         s.armed = s.paused || !s.armed;
         s.paused = false;
     });
@@ -1320,8 +1332,9 @@ fn pet_click() {
 /// Hotkey "arm" (default Ctrl+Alt+D): same as a click on the pet, with a notice (the pet may be off or out of sight).
 fn hotkey_arm() {
     pet_click();
-    let (armed, pet_on, k) = st(|s| (s.armed, s.cfg.pet, s.cfg.hotkeys.arm.clone()));
+    let (armed, pet_on, once, k) = st(|s| (s.armed, s.cfg.pet, s.cfg.pet_once, s.cfg.hotkeys.arm.clone()));
     toast(&match (armed, pet_on) {
+        (true, _) if once => format!("Đã BẬT dịch 1 lần bôi đen ở mọi app{}", key_hint(&k, " để tắt")),
         (true, _) => format!("Đã BẬT dịch bôi đen ở mọi app{}", key_hint(&k, " để tắt")),
         (false, true) => format!("Đã TẮT dịch bôi đen{}", key_hint(&k, " để bật")),
         (false, false) => format!("Chỉ dịch bôi đen trong app đã chọn (config.json){}", key_hint(&k, " để dịch mọi app")),
@@ -2044,9 +2057,14 @@ fn on_text(src: isize, x: i32, y: i32, raw: String) {
         s.wrap = (lead, tail);
         s.target = 0; // default: Vietnamese
         s.sum = n > MAX_CHARS; // too long to translate (a whole chat): sum it up
+        if s.cfg.pet_once {
+            s.armed = false; // one selection per click on the pet
+        }
         false
     });
     if !skip {
+        tray(NIM_MODIFY);
+        pet_draw();
         run();
     }
 }
