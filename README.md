@@ -35,6 +35,7 @@ Dùng luôn tài khoản Claude/ChatGPT đã đăng nhập trên máy, không c�
 - **Tóm tắt**: bấm **Tóm tắt** để rút cả đoạn chat dài thành vài câu gọn mà đủ ý: chuyện gì xảy ra, đã chốt gì, ai cần làm gì (bấm VI / EN / 中文 để đổi ngôn ngữ, bấm lần nữa để về bản dịch). Bôi đen đoạn quá dài để dịch (trên 3.000 ký tự, tối đa 20.000) thì tool tóm tắt luôn.
 - **Dán thay**: thay đoạn đang bôi đen bằng bản dịch, rất tiện khi soạn tin nhắn.
 - **Chọn model tuỳ ý**: đổi giữa Claude và Codex, model và mức effort ngay trên popup; danh sách model lấy theo tài khoản của bạn.
+- **Hết limit tự chuyển** (mặc định bật): đang dùng Codex mà hết limit thì lần dịch đó tự chạy lại bằng Claude (model Claude trong `config.json`) và tool chuyển hẳn sang Claude; ngược lại cũng vậy. Khi limit có lại, tự đổi về ở *Model ▾*. Tắt ở menu khay (*Hết limit: tự chuyển Claude ↔ Codex*) hoặc `"auto_switch": false`.
 - **Pet nhỏ ở góc màn hình**: click (hoặc `Ctrl+Alt+D`) để bật dịch, lần nữa để tắt; kéo đi đâu cũng được.
 - **Bôi đen bằng chuột hay bàn phím đều nhận**: kéo, double/triple-click, Shift+click, Shift + phím mũi tên, Ctrl+A.
 - **Không làm phiền**: popup không lấy focus của ô chat, clipboard được trả lại như cũ. Popup che mất chữ gốc thì nắm kéo nó sang chỗ khác.

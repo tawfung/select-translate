@@ -48,6 +48,7 @@ struct Config {
     claude_path: String,   // optional override, e.g. C:\...\claude.exe
     codex_path: String,    // optional override, e.g. C:\...\codex.exe
     pet: bool,             // true: click the pet, then select = translate (any app); false: every selection in `apps`
+    auto_switch: bool,     // a backend out of quota: `backend` moves to the other one (its model from this file) and stays there
     pet_once: bool,        // false: a click on the pet translates every selection until clicked again; true: select first, each click translates that selection
     pet_x: Option<i32>,    // pet position (screen pixels); null = bottom-right corner
     pet_y: Option<i32>,
@@ -127,6 +128,7 @@ impl Default for Config {
             claude_path: String::new(),
             codex_path: String::new(),
             pet: true,
+            auto_switch: true,
             pet_once: false,
             pet_x: None,
             pet_y: None,
@@ -1039,12 +1041,13 @@ fn tray_menu() {
         let k = keys();
         add(MF_STRING, 7, &format!("Dịch ảnh: chọn vùng màn hình…\t{}", k.snip));
         add(MF_SEPARATOR, 0, "");
-        let (pet_on, armed, once) = st(|s| (s.cfg.pet, s.armed, s.cfg.pet_once));
+        let (pet_on, armed, once, auto) = st(|s| (s.cfg.pet, s.armed, s.cfg.pet_once, s.cfg.auto_switch));
         add(MF_STRING | if armed { MF_CHECKED } else { 0 }, 8, &format!("Dịch bôi đen ở mọi app (= click pet)\t{}", k.arm));
         add(MF_STRING | if pet_on { MF_CHECKED } else { 0 }, 4, &format!("Pet: click pet rồi bôi đen mới dịch\t{}", k.pet));
         add(MF_STRING | if once { MF_CHECKED } else { 0 }, 10, "Bôi đen trước, click pet mới dịch (mỗi click 1 lần)");
         add(MF_STRING | if paused { MF_CHECKED } else { 0 }, 1, &format!("Tạm dừng\t{}", k.pause));
         add(MF_STRING, 2, "Model / effort…");
+        add(MF_STRING | if auto { MF_CHECKED } else { 0 }, 11, "Hết limit: tự chuyển Claude ↔ Codex");
         add(MF_STRING, 3, "Mở config.json (đổi phím tắt: mục hotkeys)");
         add(MF_STRING, 5, "Đăng nhập / đổi tài khoản Claude…");
         add(MF_STRING, 6, "Đăng nhập / đổi tài khoản Codex…");
@@ -1073,6 +1076,14 @@ fn tray_menu() {
                 toast(if once { "Bôi đen trước, rồi click pet để dịch (mỗi click 1 lần)" } else { "Click pet: dịch mọi lần bôi đen đến khi click lại" });
             }
             2 => model_menu(),
+            11 => {
+                let auto = st(|s| {
+                    s.cfg.auto_switch = !s.cfg.auto_switch;
+                    save_cfg(&s.cfg);
+                    s.cfg.auto_switch
+                });
+                toast(if auto { "Hết limit sẽ chuyển hẳn sang backend còn lại (đổi lại ở Model ▾)" } else { "Hết limit sẽ báo lỗi, không tự chuyển" });
+            }
             3 => {
                 let _ = Command::new("notepad.exe").arg(cfg_path()).spawn();
             }
@@ -1570,12 +1581,35 @@ struct Done {
     key: Key,
     out: String,
     head: String,
+    switched: bool, // auto_switch moved to the backend in `key`: keep it
 }
 type Key = (String, String, String, usize, bool, String); // backend, model, effort, target, summary, text
 
 fn label(c: &Config, target: usize, sum: bool) -> String {
     let be = if c.backend == "codex" { "Codex" } else { "Claude" };
     format!("{be} · {} · {} · {}→ {}", c.model(), c.effort(), if sum { "tóm tắt " } else { "" }, TARGETS[target].0)
+}
+
+/// The CLI says the account is out of quota / rate limited (Claude: "You've hit your limit · resets 3pm",
+/// Codex: "You've hit your usage limit…", HTTP 429), as opposed to not installed, logged out or a bad model.
+fn is_limit(e: &str) -> bool {
+    let low = e.to_lowercase();
+    ["usage limit", "rate limit", "rate_limit", "limit reached", "your limit", "session limit", "weekly limit", "quota", "429", "too many requests", "credit balance", "out of credits"]
+        .iter()
+        .any(|w| low.contains(w))
+}
+
+#[test]
+fn is_limit_ok() {
+    assert!(is_limit("You've hit your usage limit. Upgrade to Pro or try again in 3 days 4 hours."));
+    assert!(is_limit("You've hit your limit · resets 3pm (Asia/Saigon)"));
+    assert!(is_limit("Claude AI usage limit reached|1764000000"));
+    assert!(is_limit("API Error: 429 {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\"}}"));
+    assert!(is_limit("exceeded your current quota"));
+    assert!(!is_limit("Not logged in · Please run /login"));
+    assert!(!is_limit("Codex CLI không trả lời sau 90 giây"));
+    assert!(!is_limit("The model `gpt-x` does not exist or you do not have access to it."));
+    assert!(!is_limit(CANCELLED));
 }
 
 fn worker(rx: mpsc::Receiver<Job>, first: Config) {
@@ -1608,19 +1642,37 @@ fn worker(rx: mpsc::Receiver<Job>, first: Config) {
         let msg = if job.sum { sum_msg(TARGETS[job.target].1, text) } else { user_msg(TARGETS[job.target].1, text) };
         let rid = job.rid;
         let img = job.image.as_deref();
-        let codex_on = job.cfg.backend == "codex";
-        let r = if codex_on {
-            claude.close(); // only the backend in use keeps a process
-            codex.translate(&job.cfg, &msg, img, rid, &|s| post(WM_PART, rid, s.to_string()))
-        } else {
-            codex.close();
-            claude.translate(&job.cfg, &msg, img, rid, &|s| post(WM_PART, rid, s.to_string()))
+        let mut go = |c: &Config| {
+            if c.backend == "codex" {
+                claude.close(); // only the backend in use keeps a process
+                codex.translate(c, &msg, img, rid, &|s| post(WM_PART, rid, s.to_string()))
+            } else {
+                codex.close();
+                claude.translate(c, &msg, img, rid, &|s| post(WM_PART, rid, s.to_string()))
+            }
         };
+        // auto_switch: a backend out of quota hands over to the other one (with its own model from the config).
+        // When that works the switch is saved (WM_DONE): the user goes back by hand (Model ▾) once the quota is back
+        let mut switched = false;
+        let mut r = go(&job.cfg);
+        if let Err(e) = &r {
+            if is_limit(e) {
+                log(&format!("out of quota ({} {}): {e}", job.cfg.backend, job.cfg.model()));
+                if job.cfg.auto_switch {
+                    let (first, from) = (e.clone(), job.cfg.backend.clone());
+                    job.cfg.backend = if from == "codex" { "claude" } else { "codex" }.into();
+                    r = go(&job.cfg).map_err(|e2| if e2 == CANCELLED { e2 } else { format!("{first}\n(tự chuyển từ {from} sang {} cũng lỗi: {e2})", job.cfg.backend) });
+                    switched = r.is_ok();
+                }
+            }
+        }
+        let codex_on = job.cfg.backend == "codex";
         match r {
             Ok(out) => {
-                let head = format!("{} · {:.1}s", label(&job.cfg, job.target, job.sum), t.elapsed().as_secs_f32());
+                let note = if switched { format!(" · đã chuyển hẳn ({} hết limit)", if codex_on { "Claude" } else { "Codex" }) } else { String::new() };
+                let head = format!("{} · {:.1}s{note}", label(&job.cfg, job.target, job.sum), t.elapsed().as_secs_f32());
                 let key = (job.cfg.backend.clone(), job.cfg.model().to_string(), job.cfg.effort().to_string(), job.target, job.sum, job.text);
-                post(WM_DONE, rid, Done { key, out, head });
+                post(WM_DONE, rid, Done { key, out, head, switched });
             }
             Err(e) if e == CANCELLED => {} // dropped for a newer selection, which is next in the queue
             Err(e) => {
@@ -2667,12 +2719,19 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             let d = Box::from_raw(lp as *mut Done);
             let mine = st(|s| {
                 s.cache.insert(d.key.clone(), d.out.clone());
+                if d.switched {
+                    s.cfg.backend = d.key.0.clone();
+                    save_cfg(&s.cfg);
+                }
                 if s.rid == wp as u64 {
                     s.result = d.out.clone();
                     s.busy = false;
                 }
                 s.rid == wp as u64
             });
+            if d.switched {
+                tray(NIM_MODIFY);
+            }
             if mine {
                 show_msg(&d.head, &d.out, false);
             }
@@ -2688,7 +2747,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }) {
                 let low = e.to_lowercase();
                 let has = |ws: &[&str]| ws.iter().any(|w| low.contains(w));
-                let (hint, offer_login) = if has(&["không tìm thấy"]) {
+                let (hint, offer_login) = if is_limit(&e) {
+                    ("Hết limit — chờ reset hoặc chọn model khác (Model ▾)", false)
+                } else if has(&["không tìm thấy"]) {
                     ("Chưa cài CLI trên máy này", false)
                 } else if has(&["not logged", "log in", "login", "unauthorized", "401", "403", "auth", "token", "sign in"]) {
                     ("Chưa đăng nhập hoặc phiên hết hạn — bấm Đăng nhập, xong thì bôi đen lại", true)
